@@ -147,7 +147,10 @@ an incomplete configuration and SMTP is reported as not configured. With no
 | ----------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------- | -------------------- |
 | `ALERT_THRESHOLDS`                        | Default workspace alert thresholds as whole-number days relative to expiry (overridden by workspace preferences). Range **-365 to 730**: positive = days before, `0` = day of expiry, negative = days after (for example `-1`). | `30,14,7,1,0`                         | Alerts               |
 | `ALERT_MAX_ATTEMPTS`                      | Max delivery retries per alert                                              | `20`                                  | Alerts               |
+| `ALERT_DEGRADED_ATTEMPTS_THRESHOLD`       | Consecutive per-channel failures before a degraded operational warning; positive integer only (invalid, zero, or negative values use the default) | `5` | Delivery worker |
 | `ALERT_RETRY_DELAY_MS`                    | Retry delay in ms                                                           | `300000`                              | Alerts               |
+| `OP_NOTIFICATION_EMAIL_DAILY_CAP`        | Critical incidents marked emailed per workspace in a rolling 24-hour window; positive integer only (invalid, zero, or negative values use the default) | `10` | Delivery and auto-sync workers |
+| `AUTO_SYNC_CRITICAL_THRESHOLD`           | Consecutive failed auto-sync runs before its incident becomes critical; positive integer only (invalid, zero, or negative values use the default) | `3` | Auto-sync worker |
 | `ALERT_TEST_UTC_DAY`                      | Test-only scheduler day override                                            | `unset`                               | Alerts testing       |
 | `GLOBAL_RATE_LIMIT_WINDOW_MS`             | Global limiter window in ms                                                 | `60000`                               | API rate limiting    |
 | `GLOBAL_RATE_LIMIT_MAX`                   | Global limiter max requests per window                                      | `300` (prod) / `1000` (dev,test)      | API rate limiting    |
@@ -198,6 +201,11 @@ an incomplete configuration and SMTP is reported as not configured. With no
 | `CONTACT_GROUP_MEMBER_LIMITS`             | JSON plan-to-limit map (core defaults unlimited)                            | `{"oss":Infinity}`                    | Contact groups       |
 | `WORKSPACE_PLAN_LIMITS`                   | JSON plan-to-limit map (core defaults unlimited)                            | `{"oss":Infinity}`                    | Workspaces           |
 | `MEMBER_PLAN_LIMITS`                      | JSON plan-to-limit map (core defaults unlimited)                            | `{"oss":Infinity}`                    | Workspace members    |
+
+The three operational notification settings accept integers of at least `1`.
+`ALERT_DEGRADED_ATTEMPTS_THRESHOLD` is read by the delivery worker,
+`AUTO_SYNC_CRITICAL_THRESHOLD` by the auto-sync worker, and
+`OP_NOTIFICATION_EMAIL_DAILY_CAP` by both workers.
 
 ## Vault AppRole authentication
 

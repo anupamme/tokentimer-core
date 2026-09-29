@@ -109,6 +109,11 @@ const showErrorToastOnce = message => {
   showGlobalError(message);
 };
 
+const isCanceledRequest = error =>
+  axios.isCancel(error) ||
+  error?.code === 'ERR_CANCELED' ||
+  error?.name === 'AbortError';
+
 // Request interceptor for authentication and logging
 apiClient.interceptors.request.use(
   async config => {
@@ -183,6 +188,12 @@ apiClient.interceptors.response.use(
     return response;
   },
   async error => {
+    // Workspace changes abort in-flight requests. Their callers still receive
+    // the cancellation so they can ignore stale results, but it is not an API
+    // failure and must not be logged or turned into a user-facing error.
+    if (isCanceledRequest(error)) {
+      return Promise.reject(error);
+    }
     // Log error in development/staging (based on domain since env vars are not available at runtime)
     const shouldLog =
       (typeof import.meta !== 'undefined' &&
@@ -304,6 +315,7 @@ const invalidateCache = urlPrefix => {
 
 // Error handling utilities
 export const handleApiError = (error, customMessage = null) => {
+  if (isCanceledRequest(error)) return null;
   let message = customMessage;
   let suppressToast = false;
 
@@ -525,6 +537,10 @@ export const API_ENDPOINTS = {
     `/api/v1/workspaces/${id}/invitations/${invitationId}`,
   WORKSPACE_ALERT_SETTINGS: id => `/api/v1/workspaces/${id}/alert-settings`,
   WORKSPACE_NOTIFICATIONS: id => `/api/v1/workspaces/${id}/notifications`,
+  WORKSPACE_NOTIFICATION_READ: (id, notificationId) =>
+    `/api/v1/workspaces/${id}/notifications/${notificationId}/read`,
+  WORKSPACE_NOTIFICATIONS_READ_ALL: id =>
+    `/api/v1/workspaces/${id}/notifications/read-all`,
   WORKSPACE_CONTROL_CENTER_STATS: id =>
     `/api/v1/workspaces/${id}/control-center/stats`,
   WORKSPACE_CONTROL_CENTER_NEVER_EXPIRES: id =>
@@ -1117,6 +1133,26 @@ export const workspaceAPI = {
     try {
       const res = await apiClient.get(
         API_ENDPOINTS.WORKSPACE_NOTIFICATIONS(id)
+      );
+      return res.data;
+    } catch (e) {
+      throw new Error(handleApiError(e));
+    }
+  },
+  markNotificationRead: async (id, notificationId) => {
+    try {
+      const res = await apiClient.post(
+        API_ENDPOINTS.WORKSPACE_NOTIFICATION_READ(id, notificationId)
+      );
+      return res.data;
+    } catch (e) {
+      throw new Error(handleApiError(e));
+    }
+  },
+  markAllNotificationsRead: async id => {
+    try {
+      const res = await apiClient.post(
+        API_ENDPOINTS.WORKSPACE_NOTIFICATIONS_READ_ALL(id)
       );
       return res.data;
     } catch (e) {

@@ -1,4 +1,5 @@
 const { pool } = require("../db/database");
+const { currentWorkspaceAccessSql } = require("./rbac");
 
 /**
  * Requeue failed/blocked alerts for a user or a specific workspace.
@@ -23,31 +24,83 @@ async function requeueAlertsCore({
       `UPDATE alert_queue aq
        SET status = 'pending', attempts = 0, attempts_email = 0, attempts_webhooks = 0, attempts_whatsapp = 0,
            error_message = NULL, next_attempt_at = NOW(), updated_at = NOW()
-       FROM tokens t
-       WHERE aq.token_id = t.id AND t.workspace_id = $1 AND aq.user_id = $2 AND (
+       WHERE COALESCE(
+         (SELECT t.workspace_id FROM tokens t WHERE t.id = aq.token_id),
+         (SELECT ca.workspace_id FROM certops_agents ca WHERE ca.id = aq.certops_agent_id)
+       ) = $1 AND (
          aq.status IN ('failed','limit_exceeded') OR
          (aq.status = 'partial' AND (aq.error_message IS NULL OR aq.error_message NOT ILIKE '%PLAN_LIMIT%')) OR
          ${blockedCondition}
-       )`,
-      [workspaceId, userId],
+       )
+       RETURNING aq.id`,
+      [workspaceId],
     );
+    await resolveRequeuedNotifications(r.rows, workspaceId);
     return r.rowCount || 0;
   }
   const blockedCondition = includePlanLimitBlocked
-    ? `status = 'blocked'`
-    : `(status = 'blocked' AND error_message IS NOT NULL AND error_message <> 'PLAN_LIMIT' AND error_message NOT ILIKE '%PLAN_LIMIT%')`;
+    ? `aq.status = 'blocked'`
+    : `(aq.status = 'blocked' AND aq.error_message IS NOT NULL AND aq.error_message <> 'PLAN_LIMIT' AND aq.error_message NOT ILIKE '%PLAN_LIMIT%')`;
+  const workspaceAnchor = `COALESCE(
+    (SELECT t.workspace_id FROM tokens t WHERE t.id = aq.token_id),
+    (SELECT ca.workspace_id FROM certops_agents ca WHERE ca.id = aq.certops_agent_id)
+  )`;
   const r = await pool.query(
-    `UPDATE alert_queue
+    `UPDATE alert_queue aq
      SET status = 'pending', attempts = 0, attempts_email = 0, attempts_webhooks = 0, attempts_whatsapp = 0,
          error_message = NULL, next_attempt_at = NOW(), updated_at = NOW()
-     WHERE user_id = $1 AND (
-       status IN ('failed','limit_exceeded') OR
-       (status = 'partial' AND (error_message IS NULL OR error_message NOT ILIKE '%PLAN_LIMIT%')) OR
+     WHERE aq.user_id = $1
+       AND (${currentWorkspaceAccessSql(workspaceAnchor, "$1")}
+            OR (aq.token_id IS NULL AND aq.certops_agent_id IS NULL))
+       AND (
+       aq.status IN ('failed','limit_exceeded') OR
+       (aq.status = 'partial' AND (aq.error_message IS NULL OR aq.error_message NOT ILIKE '%PLAN_LIMIT%')) OR
        ${blockedCondition}
-     )`,
+     )
+     RETURNING aq.id, ${workspaceAnchor} AS workspace_id`,
     [userId],
   );
+  await resolveRequeuedNotifications(r.rows);
   return r.rowCount || 0;
 }
 
-module.exports = { requeueAlertsCore };
+/**
+ * Clear any open delivery_blocked/delivery_degraded bell notification for
+ * each alert row that was just moved back to 'pending'. Requeuing resets
+ * attempts to 0, so the prior incident is no longer accurate; the delivery
+ * worker will raise a fresh notification if the retry fails again.
+ *
+ * @param {Array<{id: number|string, workspace_id?: string}>} rows
+ * @param {string} [fixedWorkspaceId] - Use this workspace id for every row
+ *   instead of reading it off the row (workspace-scoped call site already
+ *   knows it).
+ */
+async function resolveRequeuedNotifications(rows, fixedWorkspaceId = null) {
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  const workspaceIds = [];
+  const dedupeKeys = [];
+  for (const row of rows) {
+    const wsId = fixedWorkspaceId || row.workspace_id;
+    if (!wsId) continue;
+    for (const type of ["delivery_blocked", "delivery_degraded"]) {
+      workspaceIds.push(wsId);
+      dedupeKeys.push(`${type}:${row.id}`);
+    }
+  }
+  if (dedupeKeys.length === 0) return;
+  try {
+    await pool.query(
+      `UPDATE operational_notifications n
+          SET resolved_at = NOW(), updated_at = NOW()
+         FROM unnest($1::uuid[], $2::text[]) AS keys(workspace_id, dedupe_key)
+        WHERE n.workspace_id = keys.workspace_id
+          AND n.dedupe_key = keys.dedupe_key
+          AND n.resolved_at IS NULL`,
+      [workspaceIds, dedupeKeys],
+    );
+  } catch (err) {
+    console.warn("resolveRequeuedNotifications failed", { error: err.message });
+  }
+}
+
+module.exports = { requeueAlertsCore, resolveRequeuedNotifications };

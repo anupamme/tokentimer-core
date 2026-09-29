@@ -43,6 +43,18 @@ import {
   detectWebhookProviderKind,
   resolveWebhookProviderKind,
 } from "./shared/webhookProviderKind.js";
+import {
+  raiseOperationalNotification,
+  resolveOperationalNotification,
+  sendOperationalIncidentEmail,
+  retryPendingOperationalIncidentEmails,
+  reconcileStaleDeliveryIncidents,
+} from "./shared/opNotifications.js";
+
+const OPERATIONAL_EMAIL_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
+let lastOperationalEmailSweepAt = 0;
+const DELIVERY_INCIDENT_RECONCILE_INTERVAL_MS = 5 * 60 * 1000;
+let lastDeliveryIncidentReconcileAt = 0;
 
 const { isValidEmail } = emailAddress;
 
@@ -1020,9 +1032,7 @@ function buildAgentHealthEmailContent(alert) {
   const htmlContent = `${statusBadge}${detailsTable}${impactedHtml}`;
 
   const { html, text: templateText } = generateEmailTemplate({
-    title: escapeHtml(
-      `Agent ${context.status}: ${singleLineText(context.agentName)}`,
-    ),
+    title: `Agent ${context.status}: ${singleLineText(context.agentName)}`,
     content: htmlContent,
     buttonText: "View Dashboard",
     buttonUrl: frontendUrl,
@@ -1225,6 +1235,145 @@ const MAX_ATTEMPTS_PER_CHANNEL = Number.isFinite(
   ? Number(process.env.ALERT_MAX_ATTEMPTS)
   : 20;
 
+const configuredDegradedThreshold = String(
+  process.env.ALERT_DEGRADED_ATTEMPTS_THRESHOLD || "",
+).trim();
+const parsedDegradedThreshold = Number(configuredDegradedThreshold);
+const DEGRADED_ATTEMPTS_THRESHOLD =
+  /^[1-9]\d*$/.test(configuredDegradedThreshold) &&
+  Number.isSafeInteger(parsedDegradedThreshold)
+    ? parsedDegradedThreshold
+    : 5;
+
+function incidentAssetLabel(alert) {
+  const metadata = alert.metadata || {};
+  const displayCandidates = [
+    alert.name,
+    metadata.agentName,
+    metadata.hostname,
+    metadata.agentId,
+    alert.certops_agent_id,
+    alert.token_id != null ? `Token #${alert.token_id}` : null,
+  ];
+  const boundedLabel = (value) =>
+    Array.from(
+      singleLineText(value)
+        .replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ")
+        .trim(),
+    )
+      .slice(0, 120)
+      .join("");
+  for (const candidate of displayCandidates) {
+    const label = boundedLabel(candidate);
+    if (label) return label;
+  }
+  // Only accept a known, identifier-only shape from the raw queue key.
+  if (
+    /^agent_health:[a-z0-9_-]+:(down|recovered)$/i.test(alert.alert_key || "")
+  )
+    return boundedLabel(alert.alert_key);
+  return "asset";
+}
+
+function isPlanLimitError(errorMessage) {
+  return /PLAN_LIMIT|limit_exceeded/i.test(String(errorMessage || ""));
+}
+
+export async function raiseDeliveryBlockedIncident(
+  client,
+  alert,
+  message,
+  failedChannels,
+  reason,
+  attempts = {},
+) {
+  if (!alert.workspace_id) return;
+  const planLimited = isPlanLimitError(message);
+  const assetLabel = incidentAssetLabel(alert);
+  const title = planLimited
+    ? `Delivery paused (plan limit): ${assetLabel}`
+    : `Delivery blocked: ${assetLabel}`;
+  const metadata = {
+    alert_queue_id: alert.id,
+    failed_channels: failedChannels,
+    attempts_email: attempts.email,
+    attempts_webhooks: attempts.webhooks,
+    attempts_whatsapp: attempts.whatsapp,
+    workspace_name: alert.workspace_name,
+    token_name: alert.name,
+    reason,
+  };
+  const notificationId = await raiseOperationalNotification(client, {
+    workspaceId: alert.workspace_id,
+    tokenId: alert.token_id,
+    category: "delivery",
+    type: planLimited ? "delivery_plan_limited" : "delivery_blocked",
+    severity: planLimited ? "info" : "critical",
+    dedupeKey: `delivery_blocked:${alert.id}`,
+    title,
+    message,
+    metadata,
+  });
+  if (notificationId && !planLimited) {
+    await sendOperationalIncidentEmail(client, {
+      notificationId,
+      workspaceId: alert.workspace_id,
+      tokenId: alert.token_id,
+      category: "delivery",
+      title,
+      message,
+      metadata,
+    });
+  }
+}
+
+// Plan-limited alerts are terminal and never enter the delivery claim query.
+// Reconcile a bounded batch so these rows still produce their bell incident.
+async function raiseTerminalPlanLimitedIncidents(client) {
+  await client.query("BEGIN");
+  try {
+    const result = await client.query(
+      `SELECT aq.id, aq.certops_agent_id, aq.alert_key, aq.metadata,
+              t.id AS token_id, t.name,
+              w.id AS workspace_id, w.name AS workspace_name,
+              aq.error_message
+         FROM alert_queue aq
+         LEFT JOIN tokens t ON t.id = aq.token_id
+         LEFT JOIN certops_agents ca ON ca.id = aq.certops_agent_id
+         JOIN workspaces w ON w.id = COALESCE(t.workspace_id, ca.workspace_id)
+        WHERE (aq.status = 'limit_exceeded'
+               OR (aq.status = 'blocked' AND aq.error_message ~* 'PLAN_LIMIT|limit_exceeded'))
+          AND NOT EXISTS (
+            SELECT 1 FROM operational_notifications n
+             WHERE n.workspace_id = w.id
+               AND n.dedupe_key = 'delivery_blocked:' || aq.id
+               AND n.type = 'delivery_plan_limited'
+               AND n.resolved_at IS NULL
+          )
+        ORDER BY aq.created_at DESC
+        LIMIT 100
+        FOR UPDATE OF aq SKIP LOCKED`,
+    );
+    for (const alert of result.rows) {
+      const detail = alert.error_message || "Delivery paused by plan limit";
+      const message = isPlanLimitError(detail)
+        ? detail
+        : `PLAN_LIMIT: ${detail}`;
+      await raiseDeliveryBlockedIncident(
+        client,
+        alert,
+        message,
+        [],
+        "plan_limit",
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  }
+}
+
 async function writeAudit(
   client,
   {
@@ -1294,6 +1443,8 @@ const shutdown = async (signal) => {
 
 // Exported for direct unit testing without spinning up the full worker job.
 export const _test = {
+  DEGRADED_ATTEMPTS_THRESHOLD,
+  incidentAssetLabel,
   writeAlertAudit,
   buildAgentHealthEmailContent,
   buildAgentHealthWebhookPayload,
@@ -1307,7 +1458,10 @@ export const _test = {
   RENEWAL_PATH_STATE_LABELS,
 };
 
-export async function deliveryWorkerJob({ closePool = true } = {}) {
+export async function deliveryWorkerJob({
+  closePool = true,
+  incidentEmailSender = sendEmailNotification,
+} = {}) {
   const startedAt = Date.now();
   // Owner identity for this run's claims. Every renewal and terminal write
   // is conditional on still holding this claim id, so if the claim marker
@@ -1772,6 +1926,24 @@ export async function deliveryWorkerJob({ closePool = true } = {}) {
               "Skipped no-contacts terminal write: another worker took ownership",
               { alertId: alert.id },
             );
+          } else if (alert.workspace_id) {
+            await raiseOperationalNotification(client, {
+              workspaceId: alert.workspace_id,
+              tokenId: alert.token_id,
+              category: "delivery",
+              type: "delivery_no_contacts",
+              severity: "warning",
+              dedupeKey: `delivery_blocked:${alert.id}`,
+              title: `Delivery has no contacts: ${incidentAssetLabel(alert)}`,
+              message:
+                "No email, webhook, or WhatsApp contacts are configured in the selected contact group",
+              metadata: {
+                alert_queue_id: alert.id,
+                reason: "no_contacts",
+                workspace_name: alert.workspace_name,
+                token_name: alert.name,
+              },
+            });
           }
           failed++;
           continue;
@@ -2786,6 +2958,17 @@ export async function deliveryWorkerJob({ closePool = true } = {}) {
               "Skipped sent terminal write: another worker took ownership",
               { alertId: alert.id },
             );
+          } else if (alert.workspace_id) {
+            await resolveOperationalNotification(
+              client,
+              alert.workspace_id,
+              `delivery_blocked:${alert.id}`,
+            );
+            await resolveOperationalNotification(
+              client,
+              alert.workspace_id,
+              `delivery_degraded:${alert.id}`,
+            );
           }
           // Emit an audit event for partial successes to aid diagnostics
           if (webhookPartialErrors.length > 0) {
@@ -2906,6 +3089,52 @@ export async function deliveryWorkerJob({ closePool = true } = {}) {
               "Skipped failed/blocked terminal write: another worker took ownership",
               { alertId: alert.id },
             );
+          } else if (reachedMaxAttempts || blockDueToWhatsApp) {
+            await raiseDeliveryBlockedIncident(
+              client,
+              alert,
+              errorMessages || "Maximum delivery attempts reached",
+              failedChannels,
+              blockDueToWhatsApp
+                ? "whatsapp_permanent_failure"
+                : "max_attempts",
+              {
+                email: newAttemptsEmail,
+                webhooks: newAttemptsWebhooks,
+                whatsapp: newAttemptsWhatsApp,
+              },
+            );
+          } else if (
+            alert.workspace_id &&
+            !isPlanLimitError(errorMessages) &&
+            (newAttemptsEmail >= DEGRADED_ATTEMPTS_THRESHOLD ||
+              newAttemptsWebhooks >= DEGRADED_ATTEMPTS_THRESHOLD ||
+              newAttemptsWhatsApp >= DEGRADED_ATTEMPTS_THRESHOLD)
+          ) {
+            await raiseOperationalNotification(client, {
+              workspaceId: alert.workspace_id,
+              tokenId: alert.token_id,
+              category: "delivery",
+              type: "delivery_degraded",
+              severity: "warning",
+              // The later blocked state updates this same incident row and
+              // the escalation trigger makes a read warning unread again.
+              dedupeKey: `delivery_blocked:${alert.id}`,
+              title: `Delivery retrying: ${incidentAssetLabel(alert)}`,
+              message: errorMessages || "Delivery attempts are still failing",
+              metadata: {
+                alert_queue_id: alert.id,
+                failed_channels: failedChannels,
+                attempts_email: newAttemptsEmail,
+                attempts_webhooks: newAttemptsWebhooks,
+                attempts_whatsapp: newAttemptsWhatsApp,
+                ...(nextAttemptTimestamp
+                  ? { next_attempt_at: nextAttemptTimestamp.toISOString() }
+                  : {}),
+                workspace_name: alert.workspace_name,
+                token_name: alert.name,
+              },
+            });
           }
           if (!reachedMaxAttempts && nextAttemptTimestamp) {
             try {
@@ -2977,6 +3206,46 @@ export async function deliveryWorkerJob({ closePool = true } = {}) {
       }
     }
   });
+
+  // The alert queue excludes terminal plan-limited rows.
+  try {
+    await withClient(raiseTerminalPlanLimitedIncidents);
+  } catch (err) {
+    logger.warn("Plan-limited incident sweep failed", { error: err.message });
+  }
+
+  // Reconcile stale bell incidents even when no ordinary queue row was claimed.
+  if (
+    Date.now() - lastDeliveryIncidentReconcileAt >=
+    DELIVERY_INCIDENT_RECONCILE_INTERVAL_MS
+  ) {
+    lastDeliveryIncidentReconcileAt = Date.now();
+    try {
+      await withClient(reconcileStaleDeliveryIncidents);
+    } catch (err) {
+      logger.warn("Delivery incident reconciliation failed", {
+        error: err.message,
+      });
+    }
+  }
+
+  // The alert queue excludes terminal blocked rows. Sweep their unsent incident
+  // emails independently, including on runs with no claimable alerts.
+  if (
+    Date.now() - lastOperationalEmailSweepAt >=
+    OPERATIONAL_EMAIL_SWEEP_INTERVAL_MS
+  ) {
+    lastOperationalEmailSweepAt = Date.now();
+    try {
+      await withClient((client) =>
+        retryPendingOperationalIncidentEmails(client, incidentEmailSender),
+      );
+    } catch (err) {
+      logger.warn("Operational incident email retry sweep failed", {
+        error: err.message,
+      });
+    }
+  }
 
   const durationMs = Date.now() - startedAt;
   logger.info(

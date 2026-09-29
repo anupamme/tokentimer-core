@@ -3825,6 +3825,152 @@ const migrations = [
     `,
   },
   {
+    version: 56,
+    name: "operational_notifications_schema",
+    sql: `
+      -- Operational failure notifications (delivery blocked/degraded, auto-sync
+      -- failures, ...) surfaced in the in-app bell and, for critical severity,
+      -- escalated by email. Producers raise/resolve rows by a stable
+      -- dedupe_key scoped to the still-open incident; the partial unique index
+      -- collapses repeated raises for the same open incident into one row
+      -- (updated in place) instead of creating duplicates, while still
+      -- allowing a new row once the prior incident of the same key resolves.
+      CREATE TABLE IF NOT EXISTS operational_notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        token_id INTEGER NULL REFERENCES tokens(id) ON DELETE SET NULL,
+        category TEXT NOT NULL CHECK (category IN ('delivery', 'auto_sync')),
+        type TEXT NOT NULL,
+        severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
+        dedupe_key TEXT NOT NULL,
+        title TEXT NOT NULL,
+        message TEXT NULL,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        resolved_at TIMESTAMPTZ NULL,
+        email_sent_at TIMESTAMPTZ NULL,
+        email_claim_id UUID NULL,
+        email_claimed_at TIMESTAMPTZ NULL
+      );
+
+      -- A short-lived earlier deployment may already have created the table
+      -- before this migration was appended. Add claim columns there too.
+      ALTER TABLE operational_notifications
+        ADD COLUMN IF NOT EXISTS email_claim_id UUID NULL,
+        ADD COLUMN IF NOT EXISTS email_claimed_at TIMESTAMPTZ NULL;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_operational_notifications_open_dedupe
+        ON operational_notifications(workspace_id, dedupe_key)
+        WHERE resolved_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_operational_notifications_workspace_created
+        ON operational_notifications(workspace_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_operational_notifications_workspace_unresolved
+        ON operational_notifications(workspace_id, resolved_at, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_operational_notifications_email_pending
+        ON operational_notifications(severity, email_sent_at)
+        WHERE severity = 'critical' AND email_sent_at IS NULL AND resolved_at IS NULL;
+
+      -- Per-user read state for the bell. A notification row can be read
+      -- independently by every workspace member who can see it.
+      CREATE TABLE IF NOT EXISTS operational_notification_reads (
+        notification_id UUID NOT NULL REFERENCES operational_notifications(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (notification_id, user_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_operational_notification_reads_user
+        ON operational_notification_reads(user_id);
+
+      -- A material escalation makes the existing incident unread again for
+      -- everyone who read its earlier severity. The incident row stays intact.
+      CREATE OR REPLACE FUNCTION reset_operational_notification_reads_on_escalation()
+      RETURNS trigger AS $$
+      BEGIN
+        IF (CASE NEW.severity WHEN 'critical' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END) >
+           (CASE OLD.severity WHEN 'critical' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END) THEN
+          DELETE FROM operational_notification_reads WHERE notification_id = NEW.id;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      DROP TRIGGER IF EXISTS trg_operational_notification_escalation_unread ON operational_notifications;
+      CREATE TRIGGER trg_operational_notification_escalation_unread
+        AFTER UPDATE OF severity ON operational_notifications
+        FOR EACH ROW
+        EXECUTE FUNCTION reset_operational_notification_reads_on_escalation();
+
+      -- Consecutive auto-sync failure counter, reset to 0 on success.
+      ALTER TABLE auto_sync_configs
+        ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
+  {
+    version: 57,
+    name: "operational_notification_lifecycle",
+    sql: `
+      -- Token deletion and workspace transfer end incidents about the old
+      -- workspace before the token FK can be nulled or moved.
+      CREATE OR REPLACE FUNCTION resolve_token_operational_notifications()
+      RETURNS trigger AS $$
+      DECLARE should_resolve BOOLEAN;
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          should_resolve := TRUE;
+        ELSE
+          should_resolve := OLD.workspace_id IS DISTINCT FROM NEW.workspace_id;
+        END IF;
+        IF should_resolve THEN
+          UPDATE operational_notifications
+             SET resolved_at = NOW(), updated_at = NOW()
+           WHERE token_id = OLD.id AND workspace_id = OLD.workspace_id
+             AND category = 'delivery' AND resolved_at IS NULL;
+        END IF;
+        IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      DROP TRIGGER IF EXISTS trg_resolve_token_operational_notifications ON tokens;
+      CREATE TRIGGER trg_resolve_token_operational_notifications
+        BEFORE DELETE OR UPDATE OF workspace_id ON tokens
+        FOR EACH ROW EXECUTE FUNCTION resolve_token_operational_notifications();
+      CREATE INDEX IF NOT EXISTS idx_operational_notifications_open_delivery_token
+        ON operational_notifications(token_id, workspace_id)
+        WHERE category = 'delivery' AND resolved_at IS NULL AND token_id IS NOT NULL;
+
+      -- Reconcile incidents orphaned before the lifecycle trigger existed.
+      UPDATE operational_notifications n
+         SET resolved_at = NOW(), updated_at = NOW()
+       WHERE n.category = 'delivery' AND n.resolved_at IS NULL
+         AND ((n.token_id IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM tokens t
+            WHERE t.id = n.token_id AND t.workspace_id = n.workspace_id
+         )) OR (n.token_id IS NULL AND NOT EXISTS (
+           SELECT 1 FROM alert_queue aq
+             JOIN certops_agents ca ON ca.id = aq.certops_agent_id
+            WHERE aq.id::text = n.metadata->>'alert_queue_id'
+              AND ca.workspace_id = n.workspace_id
+         )));
+
+      -- A changed incident type is new information even at equal severity.
+      CREATE OR REPLACE FUNCTION reset_operational_notification_reads_on_escalation()
+      RETURNS trigger AS $$
+      BEGIN
+        IF NEW.type IS DISTINCT FROM OLD.type OR
+           (CASE NEW.severity WHEN 'critical' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END) >
+           (CASE OLD.severity WHEN 'critical' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END) THEN
+          DELETE FROM operational_notification_reads WHERE notification_id = NEW.id;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      DROP TRIGGER IF EXISTS trg_operational_notification_escalation_unread ON operational_notifications;
+      CREATE TRIGGER trg_operational_notification_escalation_unread
+        AFTER UPDATE OF severity, type ON operational_notifications
+        FOR EACH ROW EXECUTE FUNCTION reset_operational_notification_reads_on_escalation();
+    `,
+  },
+  {
     // Versions 56-59 are owned by PR #140. The runner applies missing
     // versions by identity, so those independent migrations can arrive later.
     version: 60,
@@ -3881,6 +4027,147 @@ const migrations = [
   },
 ];
 
+// PR #72 briefly shipped this version/name sequence before PR #139 restored
+// the CertOps numbering. Those installations already have v45 in the ledger,
+// but v45 there was trust-anchor jobs, not observation locality.
+const historicalMigrationAliases = new Map([
+  [39, "operational_notifications_schema"],
+  [40, "certops_agents_capabilities_freshness_epoch"],
+  [41, "certops_diagnostic_agent_isolation"],
+  [42, "certops_diagnostic_bootstrap_requests"],
+  [43, "certops_windows_iis_target_descriptors"],
+  [44, "certops_trust_anchors"],
+  [45, "certops_trust_anchor_jobs"],
+]);
+
+function validateMigrationHistory(rows) {
+  for (const { version, name } of rows) {
+    const current = migrations.find(
+      (migration) => migration.version === version,
+    );
+    if (
+      current &&
+      name !== current.name &&
+      name !== historicalMigrationAliases.get(version)
+    ) {
+      throw new Error(
+        `Migration ${version} has unexpected name ${name}; expected ${current.name}`,
+      );
+    }
+  }
+}
+
+const observationLocalitySql = migrations.find(
+  (migration) => migration.version === 45,
+).sql;
+const observationLocalityHealthSql = `SELECT
+  (SELECT COUNT(*) FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND (table_name, column_name) IN (
+        ('certificate_targets', 'location_kind'),
+        ('certificate_instances', 'location_kind'),
+        ('certops_agents', 'downtime_alerts_enabled'),
+        ('certops_agents', 'contact_group_id'),
+        ('certops_agent_bootstrap_tokens', 'downtime_alerts_enabled'),
+        ('certops_agent_bootstrap_tokens', 'contact_group_id')
+      )) = 6
+  AND (SELECT COUNT(*) FROM pg_constraint
+    WHERE connamespace = current_schema()::regnamespace
+      AND conname IN ('managed_certificates_source_check',
+      'certificate_targets_source_check', 'certificate_instances_source_check')
+      AND pg_get_constraintdef(oid) LIKE '%agent_windows%') = 3
+  AND (SELECT COUNT(*) FROM pg_indexes
+    WHERE schemaname = current_schema()
+      AND indexname IN ('uq_managed_certificates_workspace_source_ref',
+        'uq_managed_certificates_workspace_fingerprint_import',
+        'uq_certificate_targets_workspace_agent_windows_source_ref')
+      AND indexdef LIKE '%agent_windows%') = 3 AS healthy`;
+const observationLocalityRepairSql = `
+  DROP INDEX IF EXISTS uq_certificate_targets_workspace_agent_windows_source_ref;
+  ${observationLocalitySql}
+`;
+const windowsDescriptorCorrectionSql = `
+  ALTER TABLE certificate_targets
+    DROP CONSTRAINT IF EXISTS certificate_targets_windows_site_check;
+  ALTER TABLE certificate_targets
+    ADD CONSTRAINT certificate_targets_windows_site_check CHECK (
+      windows_site IS NULL OR
+      (windows_site ~ '^[A-Za-z0-9 _.:-]+$' AND char_length(windows_site) BETWEEN 1 AND 256)
+    );
+  ALTER TABLE certificate_targets
+    DROP CONSTRAINT IF EXISTS certificate_targets_target_type_check;
+  ALTER TABLE certificate_targets
+    ADD CONSTRAINT certificate_targets_target_type_check CHECK (
+      target_type IN ('endpoint', 'domain', 'host', 'kubernetes-secret',
+        'load-balancer', 'cdn', 'appliance', 'hsm', 'vault', 'other',
+        'agent-host', 'windows-iis')
+    );
+`;
+const agentKindRepairSql = `
+  ALTER TABLE certops_agents
+    ADD COLUMN IF NOT EXISTS agent_kind TEXT NOT NULL DEFAULT 'normal';
+  ALTER TABLE certops_agents
+    DROP CONSTRAINT IF EXISTS certops_agents_agent_kind_check;
+  ALTER TABLE certops_agents
+    ADD CONSTRAINT certops_agents_agent_kind_check CHECK (agent_kind IN ('normal', 'diagnostic'));
+  CREATE INDEX IF NOT EXISTS idx_certops_agents_workspace_agent_kind
+    ON certops_agents(workspace_id, agent_kind, status);
+`;
+migrations.push({
+  version: 58,
+  name: "repair_certops_observation_locality_history",
+  sql: `
+    DO $repair$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = current_schema() AND table_name = 'certificate_targets'
+                           AND column_name = 'location_kind')
+         OR NOT EXISTS (SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = current_schema() AND table_name = 'certificate_instances'
+                           AND column_name = 'location_kind')
+         OR NOT EXISTS (SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = current_schema() AND table_name = 'certops_agents'
+                           AND column_name = 'downtime_alerts_enabled')
+         OR NOT EXISTS (SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = current_schema() AND table_name = 'certops_agents'
+                           AND column_name = 'contact_group_id')
+         OR NOT EXISTS (SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = current_schema() AND table_name = 'certops_agent_bootstrap_tokens'
+                           AND column_name = 'downtime_alerts_enabled')
+         OR NOT EXISTS (SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = current_schema() AND table_name = 'certops_agent_bootstrap_tokens'
+                           AND column_name = 'contact_group_id')
+      THEN
+        EXECUTE $observation_locality$${observationLocalitySql}$observation_locality$;
+      END IF;
+    END
+    $repair$;
+  `,
+});
+
+migrations.push({
+  version: 59,
+  name: "repair_partial_pr72_migration_history",
+  sql: `
+    -- v58 may already be recorded by an installation with an incomplete v45
+    -- index or source CHECK. Recheck the full observable v45 schema.
+    DO $repair$
+    BEGIN
+      IF NOT (${observationLocalityHealthSql}) THEN
+        EXECUTE $observation_locality$${observationLocalityRepairSql}$observation_locality$;
+      END IF;
+    END
+    $repair$;
+    CREATE INDEX IF NOT EXISTS idx_operational_notifications_open_delivery_updated
+      ON operational_notifications(updated_at, id)
+      WHERE category = 'delivery' AND resolved_at IS NULL AND metadata ? 'alert_queue_id';
+  `,
+});
+
+// Main may already contain v60 when PR #140's v58-v59 migrations arrive.
+// Apply by version rather than declaration position so each dependency exists.
+migrations.sort((a, b) => a.version - b.version);
+
 async function runMigrations() {
   logger.info("Starting database migrations...");
 
@@ -3905,12 +4192,72 @@ async function runMigrations() {
     `);
 
     const result = await client.query(
-      "SELECT version FROM migrations ORDER BY version",
+      "SELECT version, name FROM migrations ORDER BY version",
     );
+    validateMigrationHistory(result.rows);
     const executedVersions = result.rows.map((row) => row.version);
     logger.info(`Found ${executedVersions.length} executed migrations`, {
       versions: executedVersions,
     });
+
+    // PR #72 shifted every CertOps migration by one. An interrupted run can
+    // leave any one current migration v39-v45 masked by an older ledger row.
+    // Restore that effect before later migrations (v48/v52 have dependencies).
+    const historicalPrefixEnd = result.rows
+      .filter((row) => row.name === historicalMigrationAliases.get(row.version))
+      .reduce((end, row) => Math.max(end, row.version), 0);
+    if (historicalPrefixEnd && !executedVersions.includes(59)) {
+      await client.query("BEGIN");
+      try {
+        if (historicalPrefixEnd >= 43) {
+          await client.query(windowsDescriptorCorrectionSql);
+        }
+        if (historicalPrefixEnd === 40 && executedVersions.includes(44)) {
+          // v44 already widened this CHECK for trust jobs; replaying all of
+          // v40 would narrow it back to protocol_smoke only.
+          await client.query(agentKindRepairSql);
+        } else if (
+          historicalPrefixEnd === 43 &&
+          executedVersions.includes(48)
+        ) {
+          // v48 replaced the trust installation identity index. Do not
+          // recreate its older v43 definition on an already-upgraded DB.
+          await client.query(
+            migrations
+              .find((migration) => migration.version === 43)
+              .sql.replace(
+                /CREATE UNIQUE INDEX IF NOT EXISTS uq_certops_trust_anchor_installations_identity[\s\S]*?;/,
+                "",
+              ),
+          );
+        } else {
+          await client.query(
+            migrations.find(
+              (migration) => migration.version === historicalPrefixEnd,
+            ).sql,
+          );
+        }
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      }
+    }
+    // Repair v45 before v52 reads its contact-group columns. It is safe to
+    // replay after v46-v57: none alter these source CHECKs or indexes.
+    if (executedVersions.includes(45) && !executedVersions.includes(59)) {
+      const health = await client.query(observationLocalityHealthSql);
+      if (!health.rows[0].healthy) {
+        await client.query("BEGIN");
+        try {
+          await client.query(observationLocalityRepairSql);
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        }
+      }
+    }
 
     let migrationsRun = 0;
     for (const migration of migrations) {
@@ -3953,4 +4300,4 @@ if (require.main === module) {
   runMigrations().finally(() => migrationPool.end());
 }
 
-module.exports = { runMigrations, migrations };
+module.exports = { runMigrations, migrations, validateMigrationHistory };
