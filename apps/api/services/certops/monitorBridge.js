@@ -7,6 +7,7 @@ const {
   upsertManagedCertificateByMonitorSource,
 } = require("./inventory");
 const { isCertOpsEnabled } = require("./settings");
+const { pendingCsrObservationCertificate, recordCsrObservation } = require("./csrWorkflow");
 const { containsPrivateKeyMaterial } = require("../../utils/secretMaterial");
 const {
   assertSafeHostname,
@@ -273,6 +274,7 @@ async function updateManagedCertificateFromObservation(
         SET status = CASE
               WHEN managed_certificates.status IN (${RETIRE_STATUS_SQL_LIST})
               THEN managed_certificates.status
+              WHEN managed_certificates.status = 'active' THEN 'active'
               ELSE $3
             END,
             token_id = COALESCE($4, token_id),
@@ -312,7 +314,14 @@ async function updateManagedCertificateFromObservation(
   return toInventoryRecord(result.rows[0]);
 }
 
-async function upsertObservedManagedCertificate(client, certificate, options) {
+async function upsertObservedManagedCertificate(client, certificate, options, targetId) {
+  // The observation can assert deployment without pre-empting CSR promotion.
+  const pendingIdentity = await pendingCsrObservationCertificate(client, {
+    workspaceId: options.workspaceId,
+    targetId,
+    fingerprintSha256: certificate.fingerprintSha256,
+  });
+  if (pendingIdentity) return toInventoryRecord(pendingIdentity);
   // Monitor observations are keyed by source + source_ref (the monitor id), not
   // fingerprint alone. That keeps one managed_certificate row per endpoint/domain
   // monitor when the served certificate rotates (new fingerprint, same URL).
@@ -586,12 +595,13 @@ async function bridgeEndpointCertificateObservation(options = {}) {
   }
 
   return withBridgeClient(options, async (client) => {
+    const target = await upsertCertificateTarget(client, options);
     const managedCertificate = await upsertObservedManagedCertificate(
       client,
       certificate,
       options,
+      target.id,
     );
-    const target = await upsertCertificateTarget(client, options);
     const instance = await upsertCertificateInstance(
       client,
       certificate,
@@ -599,6 +609,15 @@ async function bridgeEndpointCertificateObservation(options = {}) {
       target,
       options,
     );
+
+    if (instance) {
+      await recordCsrObservation(client, {
+        workspaceId: options.workspaceId,
+        targetId: target.id,
+        fingerprintSha256: certificate.fingerprintSha256,
+        instanceId: instance.id,
+      });
+    }
 
     return {
       skipped: false,
