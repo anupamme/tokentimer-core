@@ -1,6 +1,12 @@
 const { logger } = require("../utils/logger");
 const { writeAudit } = require("../services/audit");
 const { requireAuth } = require("../middleware/auth");
+const {
+  resolveAutoSyncImportContext,
+  reconcileAutoSyncRun,
+  upsertImportedToken,
+  recordAutoSyncImportErrors,
+} = require("../services/autoSyncProvenance");
 const { getApiLimiter } = require("../middleware/rateLimit");
 const {
   generateErrorReference,
@@ -62,6 +68,10 @@ const {
 const { bindImportItemsToScan } = require("../services/scanBinding");
 
 const router = require("express").Router();
+router.use((req, _res, next) => {
+  req.integrationScanStartedAt = new Date();
+  next();
+});
 
 function hasBodyField(body, key) {
   return Object.prototype.hasOwnProperty.call(body || {}, key);
@@ -267,6 +277,7 @@ router.post(
         const workspaceId = req.workspace?.id || req.integrationQuota?.workspaceId;
         if (workspaceId) {
           const scan = await persistScan({
+            request: req,
             workspaceId,
             provider: "vault",
             identityContext: {
@@ -551,7 +562,7 @@ router.post(
       // array is only rejected when cleanup isn't the reason for the call.
       const cleanupWillRun =
         effectiveCleanup && effectiveCleanup.enabled === true;
-      if (!Array.isArray(items) || (items.length === 0 && !cleanupWillRun)) {
+      if (!Array.isArray(items) || (items.length === 0 && !cleanupWillRun && !(req.isWorkerCall && req.body?.auto_sync_run))) {
         return res.status(400).json({ error: "items array required" });
       }
 
@@ -580,6 +591,14 @@ router.post(
         provider: "vault",
         pairs: bindingPairs,
       });
+      let autoSyncRun;
+      try {
+        autoSyncRun = await resolveAutoSyncImportContext(
+          req, workspaceId, "vault", effectiveCleanup?.scanId || scanId || null,
+        );
+      } catch (error) {
+        return res.status(409).json({ error: error.message, code: error.code });
+      }
 
       // Reuse core validation constraints for type/category; allow past expiration for imports
       const ALLOWED_TYPES = [
@@ -735,34 +754,11 @@ router.post(
           // later scan-bound import (like auto-sync), leaving a permanent
           // duplicate cleanup can never reach.
           let tok;
-          let existingToken = tokenPayload.source_object_id
-            ? await Token.findBySourceIdentity({
-                workspaceId,
-                sourceProvider: tokenPayload.source_provider,
-                sourceInstance: tokenPayload.source_instance,
-                sourceOwnerKey: tokenPayload.source_owner_key,
-                sourceKind: tokenPayload.source_kind,
-                sourceObjectId: tokenPayload.source_object_id,
-              })
-            : await Token.findByNameLocationAndWorkspace(
-                tokenPayload.name,
-                tokenPayload.location,
-                workspaceId,
-              );
-          if (!existingToken && tokenPayload.source_object_id) {
-            existingToken = await Token.findUnattributedByNameLocation(
-              tokenPayload.name,
-              tokenPayload.location,
-              workspaceId,
-            );
-          }
-
-          if (existingToken) {
-            assignTokenContactGroups(tokenPayload, membership, {
-              isCreate: false,
-            });
-            // Update existing token with new characteristics
-            tok = await Token.update(existingToken.id, tokenPayload);
+          const imported = await upsertImportedToken({ context: autoSyncRun,
+            payload: tokenPayload, workspaceId, userId: req.user.id, manual: !req.isWorkerCall,
+            assignMembership: (payload, options) => assignTokenContactGroups(payload, membership, options) });
+          tok = imported.token;
+          if (!imported.created) {
             updated.push(tok);
             // Audit per-token update (best-effort)
             try {
@@ -788,17 +784,6 @@ router.post(
               logger.warn("Audit write failed", { error: _err.message });
             }
           } else {
-            assignTokenContactGroups(tokenPayload, membership, {
-              isCreate: true,
-            });
-            // Create new token
-            tok = await Token.create({
-              ...tokenPayload,
-              userId: req.user.id,
-              workspaceId,
-              created_by: req.user.id,
-              imported_at: new Date(),
-            });
             created.push(tok);
             // Audit per-token import (best-effort)
             try {
@@ -835,23 +820,33 @@ router.post(
       // persisted scan_id (see importCleanup.js for the full safety
       // contract) rather than a client-reconstructed scope.
       let cleanupDeleted = [];
+      let autoCleanupResult = null;
+      await recordAutoSyncImportErrors(autoSyncRun, errors.length);
       if (effectiveCleanup && effectiveCleanup.enabled === true) {
         try {
-          const cleanupResult = await cleanupObsoleteTokens({
-            workspaceId,
-            actorUserId: req.user.id,
-            cleanup: { ...effectiveCleanup, provider: "vault" },
-            reason:
-              effectiveCleanup.reason === "auto_sync_cleanup"
-                ? "auto_sync_cleanup"
-                : "import_cleanup",
-          });
-          cleanupDeleted = cleanupResult.deleted;
+          if (autoSyncRun) {
+            if (errors.length === 0) autoCleanupResult = await reconcileAutoSyncRun(autoSyncRun, req.body?.auto_sync_scan_ids);
+          } else if (!req.isWorkerCall) {
+            // Unfenced legacy workers may import before activation, but never delete inventory.
+            const cleanupResult = await cleanupObsoleteTokens({
+              workspaceId,
+              actorUserId: req.user.id,
+              cleanup: { ...effectiveCleanup, provider: "vault" },
+              reason: "import_cleanup",
+            });
+            cleanupDeleted = cleanupResult.deleted;
+          }
         } catch (cleanupErr) {
           logger.error("Obsolete token cleanup failed", {
             error: cleanupErr.message,
             workspaceId,
           });
+          if (autoSyncRun) {
+            return res.status(409).json({
+              error: "Auto-sync reconciliation failed; associations were retained",
+              code: "AUTO_SYNC_RECONCILIATION_FAILED",
+            });
+          }
         }
       }
 
@@ -872,7 +867,8 @@ router.post(
             ...(errors.length > 0
               ? { errors: summarizeImportErrors(errors) }
               : {}),
-            deleted_count: cleanupDeleted.length,
+            deleted_count: autoCleanupResult?.deleted ?? cleanupDeleted.length,
+            detached_count: autoCleanupResult?.detached || 0,
             source: "vault",
           },
         });
@@ -883,7 +879,10 @@ router.post(
         created_count: created.length,
         updated_count: updated.length,
         error_count: errors.length,
-        deleted_count: cleanupDeleted.length,
+        deleted_count: autoCleanupResult?.deleted ?? cleanupDeleted.length,
+        detached_count: autoCleanupResult?.detached || 0,
+        cleanup_complete: autoCleanupResult?.complete ?? null,
+        scan_complete: autoSyncRun?.scanComplete ?? null,
         deleted: cleanupDeleted,
         created,
         updated,
@@ -1005,6 +1004,7 @@ router.post(
         const workspaceId = req.workspace?.id || req.integrationQuota?.workspaceId;
         if (workspaceId && result.host && result.ownerKey) {
           const scan = await persistScan({
+            request: req,
             workspaceId,
             provider: "gitlab",
             identityContext: { host: result.host, ownerKey: result.ownerKey },
@@ -1222,6 +1222,7 @@ router.post(
         const workspaceId = req.workspace?.id || req.integrationQuota?.workspaceId;
         if (workspaceId && result.host && result.ownerKey) {
           const scan = await persistScan({
+            request: req,
             workspaceId,
             provider: "github",
             identityContext: { host: result.host, ownerKey: result.ownerKey },
@@ -1528,6 +1529,7 @@ router.post(
             region || "us-east-1",
           );
           const scan = await persistScan({
+            request: req,
             workspaceId,
             provider: "aws",
             identityContext: { accountId: result.accountId },
@@ -1741,6 +1743,7 @@ router.post(
         const workspaceId = req.workspace?.id || req.integrationQuota?.workspaceId;
         if (workspaceId) {
           const scan = await persistScan({
+            request: req,
             workspaceId,
             provider: "azure",
             identityContext: { vaultUrl },
@@ -1872,6 +1875,7 @@ router.post(
         const workspaceId = req.workspace?.id || req.integrationQuota?.workspaceId;
         if (workspaceId) {
           const scan = await persistScan({
+            request: req,
             workspaceId,
             provider: "gcp",
             identityContext: { projectId },
@@ -2069,6 +2073,7 @@ router.post(
         const workspaceId = req.workspace?.id || req.integrationQuota?.workspaceId;
         if (workspaceId && result.tenantId) {
           const scan = await persistScan({
+            request: req,
             workspaceId,
             provider: "azure-ad",
             identityContext: { tenantId: result.tenantId },
@@ -2244,7 +2249,7 @@ router.post(
       // array is only rejected when cleanup isn't the reason for the call.
       const cleanupWillRun =
         effectiveCleanup && effectiveCleanup.enabled === true;
-      if (!Array.isArray(items) || (items.length === 0 && !cleanupWillRun)) {
+      if (!Array.isArray(items) || (items.length === 0 && !cleanupWillRun && !(req.isWorkerCall && req.body?.auto_sync_run))) {
         return res.status(400).json({ error: "items array required" });
       }
       // Issue #69: apply include/exclude rules at import time too, so
@@ -2305,6 +2310,21 @@ router.post(
             error: bindErr.message,
           });
         }
+      }
+
+      let autoSyncRun;
+      try {
+        if (req.body?.auto_sync_run && providersPresent.length > 1) {
+          return res.status(400).json({ error: "Auto-sync import must contain one provider" });
+        }
+        autoSyncRun = await resolveAutoSyncImportContext(
+          req,
+          workspaceId,
+          providersPresent[0] || effectiveCleanup?.provider || req.body?.auto_sync_run?.provider,
+          effectiveCleanup?.scanId || scanId || null,
+        );
+      } catch (error) {
+        return res.status(409).json({ error: error.message, code: error.code });
       }
 
       const ALLOWED_TYPES = [
@@ -2688,34 +2708,11 @@ router.post(
           // token that a prior manual import created without one (e.g. a
           // stale/missing client scan_id), rather than shadowing it forever.
           let tok;
-          let existingToken = tokenPayload.source_object_id
-            ? await Token.findBySourceIdentity({
-                workspaceId,
-                sourceProvider: tokenPayload.source_provider,
-                sourceInstance: tokenPayload.source_instance,
-                sourceOwnerKey: tokenPayload.source_owner_key,
-                sourceKind: tokenPayload.source_kind,
-                sourceObjectId: tokenPayload.source_object_id,
-              })
-            : await Token.findByNameLocationAndWorkspace(
-                tokenPayload.name,
-                tokenPayload.location,
-                workspaceId,
-              );
-          if (!existingToken && tokenPayload.source_object_id) {
-            existingToken = await Token.findUnattributedByNameLocation(
-              tokenPayload.name,
-              tokenPayload.location,
-              workspaceId,
-            );
-          }
-
-          if (existingToken) {
-            assignTokenContactGroups(tokenPayload, membership, {
-              isCreate: false,
-            });
-            // Update existing token with new characteristics
-            tok = await Token.update(existingToken.id, tokenPayload);
+          const imported = await upsertImportedToken({ context: autoSyncRun,
+            payload: tokenPayload, workspaceId, userId: req.user.id, manual: !req.isWorkerCall,
+            assignMembership: (payload, options) => assignTokenContactGroups(payload, membership, options) });
+          tok = imported.token;
+          if (!imported.created) {
             updated.push(tok);
             try {
               await writeAudit({
@@ -2738,17 +2735,6 @@ router.post(
               logger.warn("Audit write failed", { error: _err.message });
             }
           } else {
-            assignTokenContactGroups(tokenPayload, membership, {
-              isCreate: true,
-            });
-            // Create new token
-            tok = await Token.create({
-              ...tokenPayload,
-              userId: req.user.id,
-              workspaceId,
-              created_by: req.user.id,
-              imported_at: new Date(),
-            });
             created.push(tok);
             try {
               await writeAudit({
@@ -2793,22 +2779,33 @@ router.post(
       // persisted scan_id (see importCleanup.js for the full safety
       // contract) rather than a client-reconstructed scope.
       let cleanupDeleted = [];
+      let autoCleanupResult = null;
+      await recordAutoSyncImportErrors(autoSyncRun, errors.length);
       if (effectiveCleanup && effectiveCleanup.enabled === true) {
         try {
-          const cleanupResult = await cleanupObsoleteTokens({
-            workspaceId,
-            actorUserId: req.user.id,
-            cleanup: effectiveCleanup,
-            reason: effectiveCleanup.reason === "auto_sync_cleanup"
-              ? "auto_sync_cleanup"
-              : "import_cleanup",
-          });
-          cleanupDeleted = cleanupResult.deleted;
+          if (autoSyncRun) {
+            if (errors.length === 0) autoCleanupResult = await reconcileAutoSyncRun(autoSyncRun, req.body?.auto_sync_scan_ids);
+          } else if (!req.isWorkerCall) {
+            // Unfenced legacy workers may import before activation, but never delete inventory.
+            const cleanupResult = await cleanupObsoleteTokens({
+              workspaceId,
+              actorUserId: req.user.id,
+              cleanup: effectiveCleanup,
+              reason: "import_cleanup",
+            });
+            cleanupDeleted = cleanupResult.deleted;
+          }
         } catch (cleanupErr) {
           logger.error("Obsolete token cleanup failed", {
             error: cleanupErr.message,
             workspaceId,
           });
+          if (autoSyncRun) {
+            return res.status(409).json({
+              error: "Auto-sync reconciliation failed; associations were retained",
+              code: "AUTO_SYNC_RECONCILIATION_FAILED",
+            });
+          }
         }
       }
 
@@ -2829,7 +2826,8 @@ router.post(
               ? { errors: summarizeImportErrors(errors) }
               : {}),
             filtered_out_count: filteredOutCount,
-            deleted_count: cleanupDeleted.length,
+            deleted_count: autoCleanupResult?.deleted ?? cleanupDeleted.length,
+            detached_count: autoCleanupResult?.detached || 0,
             source: "integration",
           },
         });
@@ -2841,7 +2839,10 @@ router.post(
         updated_count: updated.length,
         error_count: errors.length,
         filtered_out_count: filteredOutCount,
-        deleted_count: cleanupDeleted.length,
+        deleted_count: autoCleanupResult?.deleted ?? cleanupDeleted.length,
+        detached_count: autoCleanupResult?.detached || 0,
+        cleanup_complete: autoCleanupResult?.complete ?? null,
+        scan_complete: autoSyncRun?.scanComplete ?? null,
         deleted: cleanupDeleted,
         created,
         updated,

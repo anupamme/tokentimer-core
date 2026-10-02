@@ -98,8 +98,8 @@ function buildDimensionFilterSql(dimensions, paramOffset) {
   for (const [key, value] of Object.entries(dims)) {
     if (value === null || value === undefined || value === "") continue;
     if (key === "pathPrefix") {
-      clauses.push(`(t.source_dimensions->>'path') LIKE $${p}`);
-      params.push(`${String(value)}%`);
+      clauses.push(`starts_with(t.source_dimensions->>'path', $${p})`);
+      params.push(String(value));
       p++;
     } else if (key === "categories") {
       const list = Array.isArray(value) ? value : [value];
@@ -206,6 +206,9 @@ async function cleanupObsoleteTokens({
            AND t.source_instance = $3
            AND t.source_owner_key = $4
            AND t.source_kind = $5
+           AND NOT EXISTS (
+             SELECT 1 FROM auto_sync_token_links l WHERE l.token_id = t.id
+           )
            AND (t.source_observed_at IS NULL OR t.source_observed_at <= $7)
            ${dimensionSql}
            AND NOT EXISTS (
@@ -220,9 +223,14 @@ async function cleanupObsoleteTokens({
 
       for (const row of res.rows) {
         try {
+          // Recheck with a fresh statement snapshot after acquiring the token lock.
+          const tracked = await client.query(
+            "SELECT 1 FROM auto_sync_token_links WHERE token_id = $1 LIMIT 1", [row.id]);
+          if (tracked.rowCount) continue;
           await client.query("DELETE FROM alert_queue WHERE token_id = $1", [row.id]);
           await client.query("DELETE FROM domain_monitors WHERE token_id = $1", [row.id]);
-          await client.query("DELETE FROM tokens WHERE id = $1", [row.id]);
+          await client.query(`DELETE FROM tokens t WHERE id = $1
+            AND NOT EXISTS (SELECT 1 FROM auto_sync_token_links l WHERE l.token_id = t.id)`, [row.id]);
           deleted.push({ id: row.id, name: row.name, location: row.location });
           await writeAudit({
             client,

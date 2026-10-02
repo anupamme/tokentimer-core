@@ -12,7 +12,18 @@ async function importFresh(relativePath) {
 }
 
 describe("autoSyncFailure helpers", () => {
-  it("formatAutoSyncError prefers API error body over Axios message", async () => {
+  it("never publishes provider bodies containing quoted secrets, headers, aliases, or multiline material", async () => {
+    const mod = await importFresh("apps/worker/src/shared/autoSyncFailure.js");
+    for (const message of ['{"token":"fake-credential"}', 'Authorization: token fake-credential',
+      'PRIVATE-TOKEN: fake-credential', 'secretId=fake-credential', 'accessKeyId=fake-credential',
+      'secretAccessKey=fake-credential', 'sessionToken=fake-credential', 'accessToken=fake-credential',
+      'clientSecret=fake-credential', 'password=first second', '-----BEGIN PRIVATE KEY-----\nfake-credential']) {
+      assert.equal(mod.sanitizeAutoSyncError(message), "Auto-sync failed; review provider access and scan settings.");
+      assert.equal(mod.formatAutoSyncError({ response: { status: 403, data: { error: message } } }), "Provider request failed (HTTP 403).");
+    }
+  });
+
+  it("formatAutoSyncError reports HTTP status without provider bodies", async () => {
     const mod = await importFresh("apps/worker/src/shared/autoSyncFailure.js");
     const err = {
       message: "Request failed with status code 401",
@@ -26,16 +37,27 @@ describe("autoSyncFailure helpers", () => {
     };
     assert.strictEqual(
       mod.formatAutoSyncError(err),
-      "Authentication failed. Token may be expired (Azure CLI tokens expire quickly).",
+      "Provider request failed (HTTP 401).",
     );
   });
 
-  it("formatAutoSyncError falls back to err.message", async () => {
+  it("formatAutoSyncError suppresses untrusted exception messages", async () => {
     const mod = await importFresh("apps/worker/src/shared/autoSyncFailure.js");
     assert.strictEqual(
       mod.formatAutoSyncError(new Error("Network timeout")),
-      "Network timeout",
+      "Auto-sync failed; review provider access and scan settings.",
     );
+  });
+
+  it("redacts credential-like values and URLs from run history errors", async () => {
+    const mod = await importFresh("apps/worker/src/shared/autoSyncFailure.js");
+    const message = mod.formatAutoSyncError(new Error(
+      "Request to https://example.test/path?token=abc failed; Authorization: Bearer xyz; client_secret=hidden",
+    ));
+    assert.ok(!message.includes("abc"));
+    assert.ok(!message.includes("xyz"));
+    assert.ok(!message.includes("hidden"));
+    assert.ok(!message.includes("example.test"));
   });
 
   it("recordAutoSyncCompleted writes an AUTO_SYNC_COMPLETED audit event for scheduled runs", async () => {
@@ -144,8 +166,8 @@ describe("autoSyncFailure helpers", () => {
     }));
     const sample = mod.summarizeImportErrors(errors);
     assert.strictEqual(sample.length, 5);
-    assert.strictEqual(sample[0].item, "token-0");
-    assert.strictEqual(sample[0].error.length, 300);
+    assert.strictEqual(sample[0].item, "Imported item");
+    assert.strictEqual(sample[0].error, "Auto-sync failed; review provider access and scan settings.");
   });
 
   it("summarizeImportErrors tolerates missing/invalid input", async () => {
@@ -153,7 +175,7 @@ describe("autoSyncFailure helpers", () => {
     assert.deepStrictEqual(mod.summarizeImportErrors(undefined), []);
     assert.deepStrictEqual(mod.summarizeImportErrors("not-an-array"), []);
     assert.deepStrictEqual(mod.summarizeImportErrors([{}]), [
-      { item: "unknown", error: "unknown error" },
+      { item: "Imported item", error: "Auto-sync failed; review provider access and scan settings." },
     ]);
   });
 

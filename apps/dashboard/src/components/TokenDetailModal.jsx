@@ -1,3 +1,4 @@
+import AutoSyncProvenance from './AutoSyncProvenance.jsx';
 import { useState, useEffect, useMemo, useCallback, memo } from 'react';
 import {
   Modal,
@@ -506,6 +507,17 @@ function TokenDetailModal({
                 {renderDateField('Last updated', token.updated_at)}
               </DashboardModalDataSection>
             ) : null}
+
+            <AutoSyncProvenance
+              tokenId={token.id}
+              ownership={
+                token.auto_sync_managed
+                  ? 'Managed'
+                  : token.auto_sync_observed
+                    ? 'Observed'
+                    : 'Manual or legacy'
+              }
+            />
 
             {/* Category-specific fields */}
             {token.category === 'cert' && hasCertificateDetails && (

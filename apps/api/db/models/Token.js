@@ -145,7 +145,9 @@ const findByUserId = async (userId) => {
 };
 
 const findById = async (id) => {
-  const query = "SELECT * FROM tokens WHERE id = $1";
+  const query = `SELECT t.*, EXISTS (
+    SELECT 1 FROM auto_sync_token_links l WHERE l.token_id = t.id
+  ) AS auto_sync_observed FROM tokens t WHERE t.id = $1`;
   const result = await pool.query(query, [id]);
   const token = result.rows[0];
 
@@ -153,7 +155,7 @@ const findById = async (id) => {
   return token ? convertNumericFields(token) : null;
 };
 
-const create = async (tokenData) => {
+const create = async (tokenData, { client: transactionClient = null } = {}) => {
   const {
     userId,
     workspaceId = null,
@@ -259,7 +261,7 @@ const create = async (tokenData) => {
   ];
 
   try {
-    return await withTokenClient(async (client) => {
+    const createWithClient = async (client) => {
       const result = await client.query(query, values);
       const token = result.rows[0];
       if (token && token.workspace_id) {
@@ -273,7 +275,10 @@ const create = async (tokenData) => {
         applyMembershipFields(token, membershipIds);
       }
       return convertNumericFields(token);
-    });
+    };
+    return transactionClient
+      ? await createWithClient(transactionClient)
+      : await withTokenClient(createWithClient);
   } catch (error) {
     logger.error("create() database error", {
       message: error.message,
@@ -285,7 +290,7 @@ const create = async (tokenData) => {
   }
 };
 
-const update = async (id, tokenData) => {
+const update = async (id, tokenData, { client: transactionClient = null } = {}) => {
   const {
     name,
     expiration,
@@ -322,6 +327,7 @@ const update = async (id, tokenData) => {
     source_dimensions,
     source_object_id,
     source_observed_at,
+    auto_sync_managed,
   } = tokenData;
 
   const membershipIds = resolveUpdateMembershipIds(
@@ -476,6 +482,10 @@ const update = async (id, tokenData) => {
     values.push(source_observed_at);
     paramIndex++;
   }
+  if (auto_sync_managed !== undefined) {
+    updateFields.push(`auto_sync_managed = $${paramIndex++}`);
+    values.push(auto_sync_managed === true);
+  }
 
   // If no fields to update, return the existing token
   if (updateFields.length === 0) {
@@ -516,6 +526,7 @@ const update = async (id, tokenData) => {
       return convertNumericFields(token);
     };
 
+    if (transactionClient) return await runUpdate(transactionClient);
     if (membershipIds !== undefined) {
       return await withTokenClient(runUpdate);
     }
@@ -605,7 +616,7 @@ const findByDomain = async (userId, domain) => {
 };
 
 // Find token by name, location, and workspaceId (for deduplication during imports)
-const findByNameLocationAndWorkspace = async (name, location, workspaceId) => {
+const findByNameLocationAndWorkspace = async (name, location, workspaceId, { client = pool } = {}) => {
   // Both name AND location are required for deduplication
   if (!name) return null;
   if (location === null || location === undefined || location === "")
@@ -616,11 +627,11 @@ const findByNameLocationAndWorkspace = async (name, location, workspaceId) => {
     WHERE name = $1 
       AND workspace_id = $2
       AND location = $3
-    LIMIT 1
+    LIMIT 1 FOR UPDATE
   `;
   const values = [name, workspaceId, location];
 
-  const result = await pool.query(query, values);
+  const result = await client.query(query, values);
   const token = result.rows[0];
 
   // Convert numeric fields from strings to numbers
@@ -638,7 +649,7 @@ const findBySourceIdentity = async ({
   sourceOwnerKey,
   sourceKind,
   sourceObjectId,
-}) => {
+}, { client = pool } = {}) => {
   if (!sourceObjectId) return null;
   const query = `
     SELECT * FROM tokens
@@ -648,9 +659,9 @@ const findBySourceIdentity = async ({
       AND source_owner_key = $4
       AND source_kind = $5
       AND source_object_id = $6
-    LIMIT 1
+    LIMIT 1 FOR UPDATE
   `;
-  const result = await pool.query(query, [
+  const result = await client.query(query, [
     workspaceId,
     sourceProvider,
     sourceInstance,
@@ -670,7 +681,7 @@ const findBySourceIdentity = async ({
 // source_object_id IS NULL keeps this from ever touching an already
 // provenance-attributed row -- adoption never overrides existing provenance,
 // it only fills in provenance that was missing.
-const findUnattributedByNameLocation = async (name, location, workspaceId) => {
+const findUnattributedByNameLocation = async (name, location, workspaceId, { client = pool } = {}) => {
   if (!name) return null;
   if (location === null || location === undefined || location === "")
     return null;
@@ -681,9 +692,9 @@ const findUnattributedByNameLocation = async (name, location, workspaceId) => {
       AND workspace_id = $2
       AND location = $3
       AND source_object_id IS NULL
-    LIMIT 1
+    LIMIT 1 FOR UPDATE
   `;
-  const result = await pool.query(query, [name, workspaceId, location]);
+  const result = await client.query(query, [name, workspaceId, location]);
   const token = result.rows[0];
   return token ? convertNumericFields(token) : null;
 };

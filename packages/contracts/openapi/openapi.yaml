@@ -1076,6 +1076,57 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "500":
           $ref: "#/components/responses/InternalError"
+  /api/tokens/{id}/auto-sync-provenance:
+    get:
+      tags: [Tokens]
+      summary: Read active configurations and immutable association history
+      operationId: getTokenAutoSyncProvenance
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer, minimum: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - in: query
+          name: before
+          description: Opaque event ID returned by next_before
+          schema: { type: string, pattern: '^[1-9][0-9]{0,18}$' }
+      responses:
+        "200":
+          description: Provenance page, including former configuration names
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  managed: { type: boolean }
+                  configurations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        config_id: { type: string, format: uuid }
+                        name: { type: string }
+                        provider: { type: string }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        config_id: { type: string, format: uuid }
+                        config_name: { type: string }
+                        run_id: { type: string, format: uuid, nullable: true }
+                        event: { type: string, enum: [attached, detached] }
+                        reason: { type: string }
+                        occurred_at: { type: string, format: date-time }
+                  next_before: { type: string, nullable: true }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /api/tokens/{id}/alert-timeline:
     get:
       tags: [Tokens]
@@ -2229,6 +2280,9 @@ paths:
               type: object
               required: [provider, credentials]
               properties:
+                name:
+                  type: string
+                  maxLength: 100
                 provider:
                   type: string
                 credentials:
@@ -2263,6 +2317,102 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "500":
           $ref: "#/components/responses/InternalError"
+  /api/v1/admin/auto-sync/activation:
+    get:
+      tags: [Workspaces]
+      summary: Read multi-configuration activation state
+      operationId: getAutoSyncActivation
+      description: System admin only; self-hosted and Enterprise deployments.
+      responses:
+        "200":
+          description: Activation state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Workspaces]
+      summary: Activate multiple auto-sync configurations
+      operationId: activateMultiConfigAutoSync
+      description: System admin confirms old workers are drained and the fenced worker image is verified.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workers_drained, worker_image_verified]
+              properties:
+                workers_drained: { type: boolean }
+                worker_image_verified: { type: boolean }
+      responses:
+        "200":
+          description: Activation state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  activated_at: { type: string, format: date-time }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v1/workspaces/{id}/auto-sync/{configId}/runs:
+    get:
+      tags: [Workspaces]
+      summary: List auto-sync run history
+      operationId: listAutoSyncRuns
+      parameters:
+        - $ref: "#/components/parameters/workspaceIdParam"
+        - in: path
+          name: configId
+          required: true
+          schema: { type: string, format: uuid }
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        "200":
+          description: Stable keyset page of runs ordered by descending generation
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        run_id: { type: string, format: uuid }
+                        trigger: { type: string, enum: [schedule, manual, replacement] }
+                        generation: { type: string, description: Monotonic PostgreSQL bigint fencing token }
+                        scan_version: { type: string }
+                        started_at: { type: string, format: date-time }
+                        finished_at: { type: string, format: date-time, nullable: true }
+                        status: { type: string, enum: [running, success, partial, failed, superseded] }
+                        settings_snapshot: { type: object, additionalProperties: true }
+                        discovered_count: { type: integer }
+                        created_count: { type: integer }
+                        updated_count: { type: integer }
+                        detached_count: { type: integer }
+                        deleted_count: { type: integer }
+                        error_count: { type: integer }
+                        error: { type: string, nullable: true, description: Controlled public message without provider response bodies }
+                  next_cursor: { type: string, nullable: true }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /api/v1/workspaces/{id}/auto-sync/{configId}:
     put:
       tags: [Workspaces]
@@ -4427,7 +4577,7 @@ paths:
               type: object
               required: [csrPem]
               properties:
-                csrPem: { type: string, description: One CERTIFICATE REQUEST PEM block, at most 64 KB }
+                csrPem: { type: string, description: "One CERTIFICATE REQUEST PEM block, at most 64 KB" }
                 targetId: { type: string, format: uuid }
                 target:
                   type: object

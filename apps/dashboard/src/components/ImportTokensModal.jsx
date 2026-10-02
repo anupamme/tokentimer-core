@@ -1068,6 +1068,17 @@ export default function ImportTokensModal({
 
   // Auto-sync state
   const [autoSyncConfig, setAutoSyncConfig] = React.useState(null); // null = not loaded, false = not exists, object = exists
+  const [autoSyncConfigs, setAutoSyncConfigs] = React.useState([]);
+  const [autoSyncName, setAutoSyncName] = React.useState('');
+  const [autoSyncRuns, setAutoSyncRuns] = React.useState([]);
+  const [autoSyncRunsFor, setAutoSyncRunsFor] = React.useState(null);
+  const autoSyncHistoryKey = `${workspaceId}/${autoSyncConfig?.id}`;
+  const visibleAutoSyncRuns =
+    autoSyncRunsFor === autoSyncHistoryKey ? autoSyncRuns : [];
+  const [autoSyncRunsCursor, setAutoSyncRunsCursor] = React.useState(null);
+  const [loadingAutoSyncRuns, setLoadingAutoSyncRuns] = React.useState(false);
+  const autoSyncHistoryConfigRef = React.useRef(null);
+  autoSyncHistoryConfigRef.current = autoSyncConfig?.id;
   const [requestedAutoSyncConfig, setRequestedAutoSyncConfig] =
     React.useState(null);
   const [restoredScanParams, setRestoredScanParams] = React.useState(null);
@@ -1128,14 +1139,23 @@ export default function ImportTokensModal({
         );
         if (cancelled) return;
         const configs = res.data?.items || [];
+        setAutoSyncConfigs(configs.filter(c => c.provider === source));
         const requestedId =
           requestedAutoSyncConfig?.provider === source
             ? requestedAutoSyncConfig.id
             : null;
-        const existing = requestedId
-          ? configs.find(c => c.provider === source && c.id === requestedId)
-          : configs.find(c => c.provider === source);
+        const creating =
+          requestedAutoSyncConfig?.provider === source &&
+          requestedAutoSyncConfig?.create;
+        const existing = creating
+          ? null
+          : requestedId
+            ? configs.find(c => c.provider === source && c.id === requestedId)
+            : configs.find(c => c.provider === source);
         setAutoSyncConfig(existing || false);
+        setAutoSyncName(
+          existing?.name || (creating ? requestedAutoSyncConfig.name : source)
+        );
 
         // Restore non-secret form fields from scan_params when auto-sync is already configured
         if (existing && existing.scan_params) {
@@ -1255,6 +1275,59 @@ export default function ImportTokensModal({
       cancelled = true;
     };
   }, [workspaceId, source, requestedAutoSyncConfig]);
+
+  React.useEffect(() => {
+    if (!workspaceId || !autoSyncConfig?.id) {
+      setAutoSyncRuns([]);
+      setAutoSyncRunsCursor(null);
+      return undefined;
+    }
+    let cancelled = false;
+    setAutoSyncRunsFor(null);
+    setAutoSyncRunsCursor(null);
+    apiClient
+      .get(
+        `/api/v1/workspaces/${workspaceId}/auto-sync/${autoSyncConfig.id}/runs?limit=10`
+      )
+      .then(res => {
+        if (!cancelled) {
+          setAutoSyncRunsFor(autoSyncHistoryKey);
+          setAutoSyncRuns(res.data?.items || []);
+          setAutoSyncRunsCursor(res.data?.next_cursor || null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAutoSyncRunsFor(autoSyncHistoryKey);
+          setAutoSyncRuns([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    workspaceId,
+    autoSyncConfig?.id,
+    autoSyncConfig?.last_sync_at,
+    autoSyncHistoryKey,
+  ]);
+
+  const loadEarlierAutoSyncRuns = async () => {
+    if (!autoSyncRunsCursor || !autoSyncConfig?.id) return;
+    const configId = autoSyncConfig.id;
+    setLoadingAutoSyncRuns(true);
+    try {
+      const res = await apiClient.get(
+        `/api/v1/workspaces/${workspaceId}/auto-sync/${configId}/runs?limit=10&cursor=${encodeURIComponent(autoSyncRunsCursor)}`
+      );
+      if (autoSyncHistoryConfigRef.current === configId) {
+        setAutoSyncRuns(previous => [...previous, ...(res.data?.items || [])]);
+        setAutoSyncRunsCursor(res.data?.next_cursor || null);
+      }
+    } finally {
+      setLoadingAutoSyncRuns(false);
+    }
+  };
 
   React.useEffect(() => {
     if (!isOpen || !openRequest?.provider) return;
@@ -1492,6 +1565,7 @@ export default function ImportTokensModal({
     }
     const { credentials, scanParams } = getAutoSyncCredentials();
     const payload = {
+      name: autoSyncName,
       frequency: enableSyncFrequency,
       schedule_time: enableSyncTime,
       schedule_tz: enableSyncTz,
@@ -1526,6 +1600,7 @@ export default function ImportTokensModal({
           `/api/v1/workspaces/${workspaceId}/auto-sync`
         );
         const configs = res.data?.items || [];
+        setAutoSyncConfigs(configs.filter(c => c.provider === source));
         setAutoSyncConfig(
           configs.find(c => c.id === autoSyncConfig.id) || false
         );
@@ -1606,6 +1681,7 @@ export default function ImportTokensModal({
         `/api/v1/workspaces/${workspaceId}/auto-sync`,
         {
           provider: source,
+          name: autoSyncName,
           credentials,
           scan_params: scanParams,
           frequency: enableSyncFrequency,
@@ -1619,7 +1695,10 @@ export default function ImportTokensModal({
         `/api/v1/workspaces/${workspaceId}/auto-sync`
       );
       const configs = res.data?.items || [];
+      setAutoSyncConfigs(configs.filter(c => c.provider === source));
       const createdId = created.data?.id;
+      if (createdId)
+        setRequestedAutoSyncConfig({ provider: source, id: createdId });
       setAutoSyncConfig(
         (createdId
           ? configs.find(c => c.id === createdId)
@@ -1652,7 +1731,18 @@ export default function ImportTokensModal({
       await apiClient.delete(
         `/api/v1/workspaces/${workspaceId}/auto-sync/${autoSyncConfig.id}`
       );
-      setAutoSyncConfig(false);
+      const remainingConfigs = autoSyncConfigs.filter(
+        config => config.id !== autoSyncConfig.id
+      );
+      const nextConfig = remainingConfigs[0] || null;
+      setAutoSyncConfigs(remainingConfigs);
+      setAutoSyncConfig(nextConfig || false);
+      setAutoSyncName(nextConfig?.name || source);
+      // Refetch and restore the remaining selection instead of requesting the deleted ID.
+      setRequestedAutoSyncConfig({
+        provider: source,
+        id: nextConfig?.id || null,
+      });
       setIntegrationSubTab('scan');
       setPendingManageTab(false);
       showSuccess(`Auto-sync disabled for ${source}`);
@@ -1670,6 +1760,8 @@ export default function ImportTokensModal({
 
   // Reset bulk section and integration count when source changes
   React.useEffect(() => {
+    setError(null);
+    setFailedRows([]);
     setBulkSection('');
     setBulkContactGroupIds([]);
     setIntegrationSelectedCount(0);
@@ -2266,6 +2358,156 @@ export default function ImportTokensModal({
     })();
   }, [isOpen]);
 
+  const renderErrorAlert = () =>
+    error ? (
+      <Alert status='error' minW={0} maxW='100%' alignItems='flex-start'>
+        <AlertIcon flexShrink={0} />
+        <VStack align='start' spacing={3} w='full' minW={0} maxW='100%'>
+          {(() => {
+            const parsed = parseErrorMessage(error);
+            const errorTextColor = isLight ? 'red.800' : 'red.200';
+            const helperTextColor = isLight ? 'gray.700' : 'gray.300';
+
+            if (!parsed)
+              return (
+                <Text
+                  fontSize='sm'
+                  color={errorTextColor}
+                  whiteSpace='normal'
+                  overflowWrap='anywhere'
+                  wordBreak='break-word'
+                >
+                  {error}
+                </Text>
+              );
+
+            // For multi-line errors (with bullet points), show full message with formatting
+            const isMultiLine = parsed.fullMessage.includes('\n');
+
+            return (
+              <>
+                {!isMultiLine && (
+                  <Text
+                    fontSize='sm'
+                    fontWeight='semibold'
+                    color={errorTextColor}
+                    whiteSpace='normal'
+                    overflowWrap='anywhere'
+                    wordBreak='break-word'
+                  >
+                    {parsed.shortMessage}
+                  </Text>
+                )}
+                {parsed.commands && parsed.commands.length > 0 && (
+                  <Box w='full'>
+                    <Text fontSize='xs' mb={2} color={helperTextColor}>
+                      Run these commands to fix:
+                    </Text>
+                    <VStack align='stretch' spacing={2}>
+                      {parsed.commands.map((cmd, idx) => (
+                        <CopyableCodeBlock key={idx} code={cmd} />
+                      ))}
+                    </VStack>
+                  </Box>
+                )}
+                {isMultiLine ? (
+                  <Text
+                    fontSize='sm'
+                    color={errorTextColor}
+                    whiteSpace='pre-wrap'
+                    overflowWrap='anywhere'
+                    wordBreak='break-word'
+                  >
+                    {parsed.fullMessage}
+                  </Text>
+                ) : (
+                  parsed.fullMessage !== parsed.shortMessage &&
+                  !parsed.commands && (
+                    <Text fontSize='xs' color={helperTextColor}>
+                      {parsed.fullMessage}
+                    </Text>
+                  )
+                )}
+              </>
+            );
+          })()}
+          {failedRows && failedRows.length > 0 ? (
+            <Box maxH='120px' overflowY='auto' w='full'>
+              <Table size='xs' variant='simple'>
+                <Thead>
+                  <Tr>
+                    <Th>Row</Th>
+                    <Th>Error</Th>
+                  </Tr>
+                </Thead>
+                <Tbody>
+                  {failedRows.slice(0, 10).map(fr => (
+                    <Tr key={fr.index}>
+                      <Td>{fr.index + 2}</Td>
+                      <Td>{fr.error}</Td>
+                    </Tr>
+                  ))}
+                </Tbody>
+              </Table>
+              <HStack justify='space-between' mt={1}>
+                {failedRows.length > 10 ? (
+                  <Text fontSize='xs' color={muted}>
+                    Showing first 10 of {failedRows.length} errors.
+                  </Text>
+                ) : (
+                  <span />
+                )}
+                <Button
+                  size='xs'
+                  onClick={() => {
+                    try {
+                      const rows = [
+                        ['row', 'error'],
+                        ...failedRows.map(fr => [
+                          String(fr.index + 2),
+                          String(fr.error),
+                        ]),
+                      ];
+                      const csv = rows
+                        .map(r =>
+                          r
+                            .map(v => `"${String(v).replace(/"/g, '""')}"`)
+                            .join(',')
+                        )
+                        .join('\n');
+                      const blob = new Blob([csv], {
+                        type: 'text/csv;charset=utf-8;',
+                      });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = 'import-errors.csv';
+                      a.click();
+                      setTimeout(() => URL.revokeObjectURL(url), 1000);
+                    } catch (_) {}
+                  }}
+                >
+                  Download CSV
+                </Button>
+              </HStack>
+            </Box>
+          ) : null}
+          <Text fontSize='xs'>
+            Need help? See{' '}
+            <ChakraLink
+              href={IMPORT_DOCS.integrations}
+              textDecoration='underline'
+              color='blue.500'
+              isExternal
+            >
+              import docs
+            </ChakraLink>
+            .
+          </Text>
+        </VStack>
+      </Alert>
+    ) : null;
+
   return (
     <>
       <Modal
@@ -2585,6 +2827,55 @@ export default function ImportTokensModal({
                   p={4}
                 >
                   <VStack align='stretch' spacing={4}>
+                    <HStack spacing={3} align='flex-end'>
+                      <FormControl>
+                        <FormLabel fontSize='sm'>Configuration</FormLabel>
+                        <Select
+                          size='sm'
+                          value={autoSyncConfig.id}
+                          onChange={e =>
+                            setRequestedAutoSyncConfig({
+                              provider: source,
+                              id: e.target.value,
+                            })
+                          }
+                        >
+                          {autoSyncConfigs.map(config => (
+                            <option key={config.id} value={config.id}>
+                              {config.name ||
+                                config.connection_key ||
+                                config.provider}
+                            </option>
+                          ))}
+                        </Select>
+                      </FormControl>
+                      <Button
+                        size='sm'
+                        variant='outline'
+                        onClick={() => {
+                          setRequestedAutoSyncConfig({
+                            provider: source,
+                            create: true,
+                            name: `${source} ${autoSyncConfigs.length + 1}`,
+                          });
+                          setAutoSyncConfig(false);
+                          setAutoSyncName(
+                            `${source} ${autoSyncConfigs.length + 1}`
+                          );
+                          setIntegrationSubTab('scan');
+                        }}
+                      >
+                        Add another
+                      </Button>
+                    </HStack>
+                    <FormControl>
+                      <FormLabel fontSize='sm'>Name</FormLabel>
+                      <Input
+                        size='sm'
+                        value={autoSyncName}
+                        onChange={e => setAutoSyncName(e.target.value)}
+                      />
+                    </FormControl>
                     {autoSyncConfig.last_sync_status === 'failed' ||
                     autoSyncConfig.last_sync_status === 'partial' ? (
                       <Alert
@@ -2613,7 +2904,8 @@ export default function ImportTokensModal({
                         Status
                       </Text>
                       <Text fontSize='sm'>
-                        Provider: {autoSyncConfig.provider}
+                        Provider: {autoSyncConfig.provider} ·{' '}
+                        {autoSyncConfig.name}
                       </Text>
                       {autoSyncConfig.last_sync_at ? (
                         <Text fontSize='sm'>
@@ -2630,6 +2922,45 @@ export default function ImportTokensModal({
                           No sync run yet
                         </Text>
                       )}
+                    </Box>
+                    <Box>
+                      <Text fontSize='sm' fontWeight='semibold' mb={2}>
+                        Recent runs
+                      </Text>
+                      {autoSyncRunsFor !== autoSyncHistoryKey ? (
+                        <Text fontSize='sm' color={muted}>
+                          Loading run history…
+                        </Text>
+                      ) : visibleAutoSyncRuns.length === 0 ? (
+                        <Text fontSize='sm' color={muted}>
+                          No runs yet
+                        </Text>
+                      ) : (
+                        visibleAutoSyncRuns.map(run => (
+                          <Text key={run.run_id} fontSize='xs'>
+                            {new Date(run.started_at).toLocaleString()} ·{' '}
+                            {run.trigger} · {run.status}
+                            {' · '}found {run.discovered_count}, created{' '}
+                            {run.created_count}, updated {run.updated_count},
+                            detached {run.detached_count}, deleted{' '}
+                            {run.deleted_count}, errors {run.error_count}
+                            {run.error ? ` · ${run.error}` : ''}
+                          </Text>
+                        ))
+                      )}
+                      {autoSyncRunsFor === autoSyncHistoryKey &&
+                      autoSyncRunsCursor ? (
+                        <Button
+                          size='xs'
+                          mt={2}
+                          isLoading={loadingAutoSyncRuns}
+                          onClick={() => {
+                            void loadEarlierAutoSyncRuns().catch(() => {});
+                          }}
+                        >
+                          Earlier runs
+                        </Button>
+                      ) : null}
                     </Box>
                     <Divider />
                     <Box>
@@ -2776,6 +3107,7 @@ export default function ImportTokensModal({
 
               {source === 'vault' && !autoSyncManageMode ? (
                 <ImportVaultForm
+                  errorContent={!autoSyncManageMode ? renderErrorAlert() : null}
                   ref={vaultFormRef}
                   workspaceId={workspaceId}
                   onImportComplete={selected => {
@@ -2804,6 +3136,7 @@ export default function ImportTokensModal({
 
               {source === 'gitlab' ? (
                 <ImportGitLabForm
+                  errorContent={!autoSyncManageMode ? renderErrorAlert() : null}
                   ref={gitlabFormRef}
                   workspaceId={workspaceId}
                   onImportComplete={selected => {
@@ -2848,6 +3181,7 @@ export default function ImportTokensModal({
 
               {source === 'github' ? (
                 <ImportGitHubForm
+                  errorContent={!autoSyncManageMode ? renderErrorAlert() : null}
                   ref={githubFormRef}
                   workspaceId={workspaceId}
                   onImportComplete={selected => {
@@ -2892,6 +3226,7 @@ export default function ImportTokensModal({
 
               {source === 'aws' && !autoSyncManageMode ? (
                 <ImportAWSForm
+                  errorContent={!autoSyncManageMode ? renderErrorAlert() : null}
                   ref={awsFormRef}
                   initialAutoSyncScanParams={awsAutoSyncScanParams}
                   workspaceId={workspaceId}
@@ -2921,6 +3256,7 @@ export default function ImportTokensModal({
 
               {source === 'azure' ? (
                 <ImportAzureForm
+                  errorContent={!autoSyncManageMode ? renderErrorAlert() : null}
                   ref={azureFormRef}
                   workspaceId={workspaceId}
                   onImportComplete={selected => {
@@ -2951,6 +3287,7 @@ export default function ImportTokensModal({
 
               {source === 'gcp' && !autoSyncManageMode ? (
                 <ImportGCPForm
+                  errorContent={!autoSyncManageMode ? renderErrorAlert() : null}
                   ref={gcpFormRef}
                   workspaceId={workspaceId}
                   onImportComplete={selected => {
@@ -3068,6 +3405,7 @@ export default function ImportTokensModal({
                       </Button>
                     ) : null}
                   </HStack>
+                  {!autoSyncManageMode ? renderErrorAlert() : null}
                   <Box
                     border='1px solid'
                     borderColor={border}
@@ -3191,175 +3529,18 @@ export default function ImportTokensModal({
                 </HStack>
               ) : null}
 
-              {error ? (
-                <Alert
-                  status='error'
-                  minW={0}
-                  maxW='100%'
-                  alignItems='flex-start'
-                >
-                  <AlertIcon flexShrink={0} />
-                  <VStack
-                    align='start'
-                    spacing={3}
-                    w='full'
-                    minW={0}
-                    maxW='100%'
-                  >
-                    {(() => {
-                      const parsed = parseErrorMessage(error);
-                      const errorTextColor = isLight ? 'red.800' : 'red.200';
-                      const helperTextColor = isLight ? 'gray.700' : 'gray.300';
-
-                      if (!parsed)
-                        return (
-                          <Text
-                            fontSize='sm'
-                            color={errorTextColor}
-                            whiteSpace='normal'
-                            overflowWrap='anywhere'
-                            wordBreak='break-word'
-                          >
-                            {error}
-                          </Text>
-                        );
-
-                      // For multi-line errors (with bullet points), show full message with formatting
-                      const isMultiLine = parsed.fullMessage.includes('\n');
-
-                      return (
-                        <>
-                          {!isMultiLine && (
-                            <Text
-                              fontSize='sm'
-                              fontWeight='semibold'
-                              color={errorTextColor}
-                              whiteSpace='normal'
-                              overflowWrap='anywhere'
-                              wordBreak='break-word'
-                            >
-                              {parsed.shortMessage}
-                            </Text>
-                          )}
-                          {parsed.commands && parsed.commands.length > 0 && (
-                            <Box w='full'>
-                              <Text
-                                fontSize='xs'
-                                mb={2}
-                                color={helperTextColor}
-                              >
-                                Run these commands to fix:
-                              </Text>
-                              <VStack align='stretch' spacing={2}>
-                                {parsed.commands.map((cmd, idx) => (
-                                  <CopyableCodeBlock key={idx} code={cmd} />
-                                ))}
-                              </VStack>
-                            </Box>
-                          )}
-                          {isMultiLine ? (
-                            <Text
-                              fontSize='sm'
-                              color={errorTextColor}
-                              whiteSpace='pre-wrap'
-                              overflowWrap='anywhere'
-                              wordBreak='break-word'
-                            >
-                              {parsed.fullMessage}
-                            </Text>
-                          ) : (
-                            parsed.fullMessage !== parsed.shortMessage &&
-                            !parsed.commands && (
-                              <Text fontSize='xs' color={helperTextColor}>
-                                {parsed.fullMessage}
-                              </Text>
-                            )
-                          )}
-                        </>
-                      );
-                    })()}
-                    {failedRows && failedRows.length > 0 ? (
-                      <Box maxH='120px' overflowY='auto' w='full'>
-                        <Table size='xs' variant='simple'>
-                          <Thead>
-                            <Tr>
-                              <Th>Row</Th>
-                              <Th>Error</Th>
-                            </Tr>
-                          </Thead>
-                          <Tbody>
-                            {failedRows.slice(0, 10).map(fr => (
-                              <Tr key={fr.index}>
-                                <Td>{fr.index + 2}</Td>
-                                <Td>{fr.error}</Td>
-                              </Tr>
-                            ))}
-                          </Tbody>
-                        </Table>
-                        <HStack justify='space-between' mt={1}>
-                          {failedRows.length > 10 ? (
-                            <Text fontSize='xs' color={muted}>
-                              Showing first 10 of {failedRows.length} errors.
-                            </Text>
-                          ) : (
-                            <span />
-                          )}
-                          <Button
-                            size='xs'
-                            onClick={() => {
-                              try {
-                                const rows = [
-                                  ['row', 'error'],
-                                  ...failedRows.map(fr => [
-                                    String(fr.index + 2),
-                                    String(fr.error),
-                                  ]),
-                                ];
-                                const csv = rows
-                                  .map(r =>
-                                    r
-                                      .map(
-                                        v =>
-                                          `"${String(v).replace(/"/g, '""')}"`
-                                      )
-                                      .join(',')
-                                  )
-                                  .join('\n');
-                                const blob = new Blob([csv], {
-                                  type: 'text/csv;charset=utf-8;',
-                                });
-                                const url = URL.createObjectURL(blob);
-                                const a = document.createElement('a');
-                                a.href = url;
-                                a.download = 'import-errors.csv';
-                                a.click();
-                                setTimeout(
-                                  () => URL.revokeObjectURL(url),
-                                  1000
-                                );
-                              } catch (_) {}
-                            }}
-                          >
-                            Download CSV
-                          </Button>
-                        </HStack>
-                      </Box>
-                    ) : null}
-                    <Text fontSize='xs'>
-                      Need help? See{' '}
-                      <ChakraLink
-                        href={IMPORT_DOCS.integrations}
-                        textDecoration='underline'
-                        color='blue.500'
-                        isExternal
-                      >
-                        import docs
-                      </ChakraLink>
-                      .
-                    </Text>
-                  </VStack>
-                </Alert>
-              ) : null}
+              {autoSyncManageMode ||
+              ![
+                'vault',
+                'gitlab',
+                'github',
+                'aws',
+                'azure',
+                'gcp',
+                'azure-ad',
+              ].includes(source)
+                ? renderErrorAlert()
+                : null}
 
               {source === 'file' && rows.length > 0 ? (
                 <Box>
@@ -3732,6 +3913,14 @@ export default function ImportTokensModal({
                   Provider: {source}
                 </Text>
               </Box>
+              <FormControl>
+                <FormLabel fontSize='sm'>Configuration name</FormLabel>
+                <Input
+                  size='sm'
+                  value={autoSyncName}
+                  onChange={e => setAutoSyncName(e.target.value)}
+                />
+              </FormControl>
               <HStack spacing={4} align='flex-end'>
                 <FormControl flex='1'>
                   <FormLabel fontSize='sm'>Frequency</FormLabel>

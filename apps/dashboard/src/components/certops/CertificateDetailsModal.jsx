@@ -1,3 +1,4 @@
+import AutoSyncProvenance from '../AutoSyncProvenance.jsx';
 import {
   Children,
   cloneElement,
@@ -776,6 +777,17 @@ export default function CertificateDetailsModal({
                 />
               ) : null}
             </Section>
+
+            <AutoSyncProvenance
+              tokenId={token.id}
+              ownership={
+                token.auto_sync_managed
+                  ? 'Managed'
+                  : token.auto_sync_observed
+                    ? 'Observed'
+                    : 'Manual or legacy'
+              }
+            />
 
             {isEditing || hasCertificateDetails ? (
               <Section
