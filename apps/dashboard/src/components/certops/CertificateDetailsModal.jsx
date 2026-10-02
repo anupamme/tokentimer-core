@@ -7,11 +7,9 @@ import {
   useMemo,
   useState,
 } from 'react';
-import { Link as RouterLink } from 'react-router';
 import {
   Badge,
   Box,
-  Button,
   Grid,
   Heading,
   HStack,
@@ -645,16 +643,6 @@ export default function CertificateDetailsModal({
         <ModalCloseButton {...closeButtonProps} top={{ base: 3, md: 3 }} />
 
         <ModalBody {...bodyProps} py={{ base: 4, md: 4 }}>
-          {!isViewer && certificate?.id ? (
-            <Button
-              as={RouterLink}
-              to={`/certops/certificates?csrCertificateId=${encodeURIComponent(certificate.id)}`}
-              size='sm'
-              mb={3}
-            >
-              Start CSR workflow
-            </Button>
-          ) : null}
           <DashboardDetailsSummary items={summaryItems} />
 
           {certOpsLoading ? (
@@ -946,21 +934,25 @@ export default function CertificateDetailsModal({
                 ) : null}
                 {hasAnyValue(certificate?.source, certificate?.sourceRef) ? (
                   <DetailRow label='Registration source'>
-                    <VStack align='start' spacing={1}>
+                    <HStack spacing={2} minW={0} whiteSpace='nowrap'>
                       {hasValue(certificate.source) ? (
-                        <Text fontSize='sm'>
+                        <Text fontSize='sm' flexShrink={0}>
                           {sourceLabel(certificate.source)}
+                        </Text>
+                      ) : null}
+                      {hasValue(certificate.source) && certificate.sourceRef ? (
+                        <Text as='span' color='dashboard.modal.muted'>
+                          ·
                         </Text>
                       ) : null}
                       {certificate.sourceRef ? (
                         <CopyableId
                           id={certificate.sourceRef}
-                          label='Reference'
                           size='xs'
                           color='dashboard.modal.text'
                         />
                       ) : null}
-                    </VStack>
+                    </HStack>
                   </DetailRow>
                 ) : null}
                 {hasValue(certificate?.serialNumber) ? (

@@ -1,6 +1,6 @@
 {
   "name": "@tokentimer/worker",
-  "version": "0.16.1",
+  "version": "0.17.0",
   "private": true,
   "license": "AGPL-3.0-or-later",
   "packageManager": "pnpm@11.13.0",
@@ -32,8 +32,10 @@
     "@tokentimer/log-scrub": "workspace:*",
     "@tokentimer/node-compat": "workspace:*",
     "@tokentimer/webhook-safety": "workspace:*",
+    "asn1js": "3.0.10",
     "axios": "1.18.0",
-    "nodemailer": "10.0.2",
+    "pkijs": "3.4.0",
+    "nodemailer": "10.0.12",
     "pg": "8.18.0",
     "prom-client": "15.1.3",
     "winston": "3.19.0"

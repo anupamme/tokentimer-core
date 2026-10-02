@@ -9,9 +9,22 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-29
+
+### Added
+
+- **CertOps operator-supplied CSR workflow** (#245). Managers can upload and export a public CSR, import the signed public certificate, review issued-name changes, and complete installation through a matching observation or audited manual attestation. CSR controls live in the CertOps Certificates tab, including a viewport-sized dialog. The workflow preserves certificate identity and deployment history; private keys and key packages remain rejected. Database migration 60 adds the workflow records.
+- **Published images are boot-tested in CI** (#273). The API, dashboard, worker entrypoints, and Kubernetes controller must start from their built images, catching missing runtime files before release.
+
 ### Fixed
 
 - **`GET /api/tokens` pages stay distinct when many tokens share `created_at`.** Offset 0 and 1 no longer return the same row. The list sort now ties on `id`.
+- **Certificate renewal failure webhooks use provider-specific payloads** (#275). Slack, Discord, Teams, and PagerDuty receive the certificate, job, and error context with provider-appropriate escaping.
+- **Frontend coverage is a blocking CI gate** (#227, #277). Maintainer pre-merge validation and the required green post-merge CI run are documented in `CONTRIBUTING.md`.
+
+### Security
+
+- Updated Nodemailer to 10.0.12 and the transitive `ip-address` pin to 10.7.2 to address [GHSA-6vj9-mwq6-2f5v](https://github.com/advisories/GHSA-6vj9-mwq6-2f5v), [GHSA-rpw4-54j3-4h4q](https://github.com/advisories/GHSA-rpw4-54j3-4h4q), and [GHSA-2vr4-cq9g-pvrc](https://github.com/advisories/GHSA-2vr4-cq9g-pvrc). Also update the `brace-expansion` and `fast-uri` transitive pins to 5.0.12 and 3.1.8 to clear the release dependency audit. **Operator action:** rebuild and roll the API and worker images with this release.
 
 ## [0.16.1] - 2026-09-17
 
