@@ -102,7 +102,23 @@ export const MANAGED_CERTIFICATE_STATUSES = Object.keys(STATUS_LABELS);
 
 export function statusLabel(status) {
   const key = String(status || '').toLowerCase();
+  if (key === 'unknown') return 'Unknown';
   return STATUS_LABELS[key] || (status ? String(status) : 'Unknown');
+}
+
+/** Lifecycle belongs to the identity; source expiry must not recolor it. */
+export function certificateLifecycleDescriptor(certificate) {
+  const identified = Boolean(
+    certificate?.identityId || certificate?.fingerprintSha256
+  );
+  const status = identified
+    ? certificate?.lifecycleStatus || certificate?.status
+    : certificate?.status || certificate?.lifecycleStatus;
+  return {
+    status,
+    label: (identified && certificate?.lifecycleDisplay) || statusLabel(status),
+    scheme: statusScheme(status),
+  };
 }
 
 // Mirrors MANAGED_CERTIFICATE_SOURCES in
@@ -520,6 +536,35 @@ export function sortCertificatesForToken(certificates) {
 export function pickPrimaryCertificate(certificates) {
   const sorted = sortCertificatesForToken(certificates);
   return sorted.length > 0 ? sorted[0] : null;
+}
+
+export const AMBIGUOUS_CERTIFICATE_LINK_MESSAGE =
+  'This asset is linked to multiple certificate identities. Choose a certificate in CertOps to view its details or change its lifecycle.';
+
+/** A token link alone cannot identify a certificate across rotation or imports. */
+export function resolveTokenCertificate(certificates) {
+  const items = Array.isArray(certificates) ? certificates.filter(Boolean) : [];
+  const identities = new Set(
+    items.map((certificate, index) => {
+      const fingerprint = String(certificate.fingerprintSha256 || '')
+        .replace(/:/g, '')
+        .trim()
+        .toLowerCase();
+      return /^[a-f0-9]{64}$/.test(fingerprint)
+        ? fingerprint
+        : `unidentified:${certificate.id || index}`;
+    })
+  );
+  const ambiguousLink = identities.size > 1;
+  return {
+    certificate: ambiguousLink ? null : pickPrimaryCertificate(items),
+    certificateCount: identities.size,
+    ambiguousLink,
+    // Ambiguity must never make a linked token eligible for hard deletion.
+    hasManagedLinks: items.length > 0,
+    allRetired:
+      items.length > 0 && items.every(item => isRetiredStatus(item.status)),
+  };
 }
 
 /** Matches apps/api/services/certops/inventory.js KEY_REFERENCE_MAX_LENGTH. */

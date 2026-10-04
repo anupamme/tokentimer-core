@@ -204,6 +204,35 @@ describe('CertificateDetailsModal', () => {
     ).toBeInTheDocument();
   });
 
+  it('shows asset facts and an explicit CertOps link without blending another identity', () => {
+    renderModal({
+      token: { ...token, workspace_id: 'ws-shared' },
+      certOps: {
+        certificate: {
+          ...certificate,
+          serialNumber: 'unrelated-B-serial',
+          fingerprintSha256: 'b'.repeat(64),
+        },
+        certificateCount: 2,
+        ambiguousLink: true,
+      },
+    });
+    expect(
+      screen.getByText(
+        /This asset is linked to multiple certificate identities/
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('link', { name: 'Choose a certificate in CertOps' })
+    ).toHaveAttribute('href', '/certops/certificates?workspace=ws-shared');
+    expect(screen.getByText('token-serial')).toBeInTheDocument();
+    expect(screen.queryByText('unrelated-B-serial')).not.toBeInTheDocument();
+    expect(screen.queryByText('b'.repeat(64))).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/most recently updated active certificate/)
+    ).not.toBeInTheDocument();
+  });
+
   it('presents certificate identity, lifecycle summary, and compact vertical content', () => {
     renderModal();
 
@@ -374,11 +403,12 @@ describe('CertificateDetailsModal', () => {
     expect(screen.queryByText('Technical details')).not.toBeInTheDocument();
   });
 
-  it('uses managed X.509 validity for expiry badges instead of the asset date', () => {
+  it('shows managed X.509 expiry once in the Expires tile instead of the asset date', () => {
     const now = Date.now();
     const expiringCertificate = {
       ...certificate,
       status: 'expiring',
+      lifecycleStatus: 'active',
       notAfter: new Date(now + 2 * 24 * 60 * 60 * 1000).toISOString(),
     };
 
@@ -398,8 +428,9 @@ describe('CertificateDetailsModal', () => {
       },
     });
 
-    expect(screen.getAllByText('Expiring').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('2d left').length).toBeGreaterThan(0);
+    expect(screen.getByText('Active')).toBeInTheDocument();
+    expect(screen.queryByText('Expiring')).not.toBeInTheDocument();
+    expect(screen.getAllByText('2d left')).toHaveLength(1);
     expect(screen.queryByText('Expired 31d ago')).not.toBeInTheDocument();
 
     const expiryBadges = Array.from(
@@ -407,9 +438,9 @@ describe('CertificateDetailsModal', () => {
     ).filter(node => node.textContent === '2d left');
     const statusBadges = Array.from(
       document.querySelectorAll('.chakra-badge')
-    ).filter(node => node.textContent === 'Expiring');
+    ).filter(node => node.textContent === 'Active');
 
-    expect(expiryBadges).toHaveLength(1);
+    expect(expiryBadges).toHaveLength(0);
     expect(statusBadges).toHaveLength(1);
     const expiresSummary = screen.getByText('Expires').closest('section');
     expect(within(expiresSummary).getByText('2d left')).toBeInTheDocument();

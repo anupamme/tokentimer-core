@@ -1,13 +1,15 @@
+import CertOpsBadge, { CertificateLifecycleBadge } from './CertOpsBadge.jsx';
 import {
-  Badge,
   Box,
   Code,
   Divider,
   GridItem,
   HStack,
+  Link,
   Text,
   VStack,
 } from '@chakra-ui/react';
+import { Link as RouterLink } from 'react-router';
 import { useDashboardTheme } from '../../hooks/useDashboardTheme';
 import { DashboardErrorAlert } from '../DashboardPrimitives.jsx';
 import CertificateInstances from './CertificateInstances.jsx';
@@ -16,11 +18,10 @@ import KeyLocalityList from './KeyLocalityList.jsx';
 import RenewalBadge from './RenewalBadge.jsx';
 import RenewalPathBadge from './RenewalPathBadge.jsx';
 import {
-  expiryDescriptor,
+  AMBIGUOUS_CERTIFICATE_LINK_MESSAGE,
   formatDate,
   isCertToken,
   renewalDescriptor,
-  statusScheme,
 } from './certopsFormat';
 import { useCertOpsForToken } from './useCertOps.js';
 
@@ -52,15 +53,21 @@ export default function TokenCertOpsPanel({ token, tokenId }) {
   // Cheap guard before any hooks: only certificate assets get this panel. The
   // hooks live in CertOpsPanelBody so they are never called conditionally.
   if (!isCertToken(token)) return null;
-  return <CertOpsPanelBody tokenId={token?.id ?? tokenId} />;
+  return (
+    <CertOpsPanelBody
+      tokenId={token?.id ?? tokenId}
+      workspaceId={token?.workspace_id}
+    />
+  );
 }
 
-function CertOpsPanelBody({ tokenId }) {
+function CertOpsPanelBody({ tokenId, workspaceId }) {
   const { muted, dashboard } = useDashboardTheme();
   const {
     enabled,
     certificate,
     certificateCount,
+    ambiguousLink,
     instances,
     instancesAvailable,
     instancesError,
@@ -85,9 +92,24 @@ function CertOpsPanelBody({ tokenId }) {
       </GridItem>
     );
   }
+  if (ambiguousLink) {
+    return (
+      <GridItem colSpan={{ base: 1, md: 2 }}>
+        <Text fontSize='sm' color={muted}>
+          {AMBIGUOUS_CERTIFICATE_LINK_MESSAGE}
+        </Text>
+        <Link
+          as={RouterLink}
+          to={`/certops/certificates${workspaceId ? `?workspace=${encodeURIComponent(workspaceId)}` : ''}`}
+          color='blue.400'
+        >
+          Choose a certificate in CertOps
+        </Link>
+      </GridItem>
+    );
+  }
   if (!certificate) return null;
 
-  const expiry = expiryDescriptor(certificate.notAfter);
   const renewal = renewalDescriptor(certificate.renewal);
   const sans = Array.isArray(certificate.subjectAltNames)
     ? certificate.subjectAltNames
@@ -116,18 +138,9 @@ function CertOpsPanelBody({ tokenId }) {
           >
             Certificate operations
           </Text>
-          <Badge
-            colorScheme={statusScheme(certificate.status)}
-            variant='subtle'
-            textTransform='none'
-          >
-            {certificate.status || 'unknown'}
-          </Badge>
-          <Badge colorScheme={expiry.scheme} variant='subtle'>
-            {expiry.label}
-          </Badge>
-          <RenewalBadge renewal={certificate.renewal} fontSize='sm' />
-          <RenewalPathBadge certificate={certificate} fontSize='sm' />
+          <CertificateLifecycleBadge certificate={certificate} />
+          <RenewalBadge renewal={certificate.renewal} />
+          <RenewalPathBadge certificate={certificate} />
         </HStack>
         {certificateCount > 1 ? (
           <Text fontSize='xs' color={muted} mb={3}>
@@ -161,7 +174,7 @@ function CertOpsPanelBody({ tokenId }) {
 
       <Field label='Automatic renewal'>
         <VStack align='start' spacing={2}>
-          <RenewalBadge renewal={certificate.renewal} fontSize='sm' />
+          <RenewalBadge renewal={certificate.renewal} />
           <Text
             fontSize='xs'
             color={renewal.isWarning ? dashboard.state.warning : muted}
@@ -208,9 +221,7 @@ function CertOpsPanelBody({ tokenId }) {
           </Text>
           <HStack flexWrap='wrap' spacing={2}>
             {sans.map(san => (
-              <Badge key={san} variant='outline' textTransform='none'>
-                {san}
-              </Badge>
+              <CertOpsBadge key={san}>{san}</CertOpsBadge>
             ))}
           </HStack>
         </GridItem>

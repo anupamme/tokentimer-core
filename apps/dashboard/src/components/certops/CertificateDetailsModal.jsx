@@ -1,12 +1,13 @@
+import { CertificateLifecycleBadge } from './CertOpsBadge.jsx';
 import Section from '../DashboardDetailsSection.jsx';
 import AutoSyncProvenance from '../AutoSyncProvenance.jsx';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Badge,
   Box,
   Grid,
   HStack,
   Input,
+  Link,
   Modal,
   ModalBody,
   ModalCloseButton,
@@ -17,6 +18,7 @@ import {
   Textarea,
   VStack,
 } from '@chakra-ui/react';
+import { Link as RouterLink } from 'react-router';
 import { FileText, Info, MapPin, Settings } from 'lucide-react';
 import { TOKEN_CATEGORIES } from '../../constants/tokenCategories.js';
 import { tokenAPI } from '../../utils/apiClient';
@@ -48,12 +50,11 @@ import RenewalBadge from './RenewalBadge.jsx';
 import RenewalPathBadge from './RenewalPathBadge.jsx';
 import {
   expiryDescriptor,
+  AMBIGUOUS_CERTIFICATE_LINK_MESSAGE,
   formatDate,
   keyModeLabel,
   renewalDescriptor,
   sourceLabel,
-  statusLabel,
-  statusScheme,
 } from './certopsFormat.js';
 
 function hasValue(value) {
@@ -168,31 +169,6 @@ function DetailRow({
   );
 }
 
-function CertificateStateBadges({ status, expiry }) {
-  return (
-    <>
-      {status ? (
-        <Badge
-          colorScheme={statusScheme(status)}
-          variant='subtle'
-          textTransform='none'
-        >
-          {statusLabel(status)}
-        </Badge>
-      ) : null}
-      {expiry ? (
-        <Badge
-          colorScheme={expiry.scheme}
-          variant='subtle'
-          textTransform='none'
-        >
-          {expiry.label}
-        </Badge>
-      ) : null}
-    </>
-  );
-}
-
 export default function CertificateDetailsModal({
   token,
   isOpen,
@@ -224,14 +200,16 @@ export default function CertificateDetailsModal({
   const [editData, setEditData] = useState(() => createTokenEditData(token));
 
   const {
-    certificate,
+    certificate: linkedCertificate,
     certificateCount = 0,
+    ambiguousLink = false,
     instances = [],
     instancesAvailable = true,
     instancesError = '',
     loading: certOpsLoading = false,
     error: certOpsError = '',
   } = certOps;
+  const certificate = ambiguousLink ? null : linkedCertificate;
 
   useEffect(() => {
     setSaveError('');
@@ -313,7 +291,13 @@ export default function CertificateDetailsModal({
           label: 'Expires',
           value: formatDate(expiresAt),
           help: (
-            <Text as='span' color={expiryColor} fontWeight='semibold'>
+            <Text
+              as='span'
+              color={expiryColor}
+              _light={{ color: expiryColor }}
+              _dark={{ color: expiryColor }}
+              fontWeight='semibold'
+            >
               {expiry.label}
             </Text>
           ),
@@ -435,7 +419,6 @@ export default function CertificateDetailsModal({
             statusBadges={
               hasAnyValue(
                 certificate?.status,
-                expiresAt,
                 hasRenewalData ? certificate?.renewal : null,
                 hasKeyLocality
                   ? certificate?.keyMode || certificate?.keyReference
@@ -446,10 +429,9 @@ export default function CertificateDetailsModal({
                   : null
               ) ? (
                 <>
-                  <CertificateStateBadges
-                    status={certificate?.status}
-                    expiry={hasValue(expiresAt) ? expiry : null}
-                  />
+                  {certificate ? (
+                    <CertificateLifecycleBadge certificate={certificate} />
+                  ) : null}
                   {hasKeyLocality ? (
                     <KeyLocalityBadge
                       keyMode={certificate.keyMode}
@@ -495,7 +477,21 @@ export default function CertificateDetailsModal({
               {certOpsError}
             </Text>
           ) : null}
-          {certificateCount > 1 ? (
+          {ambiguousLink ? (
+            <Box mb={4} role='status'>
+              <Text fontSize='sm' color='dashboard.modal.muted'>
+                {AMBIGUOUS_CERTIFICATE_LINK_MESSAGE}
+              </Text>
+              <Link
+                as={RouterLink}
+                to={`/certops/certificates${token.workspace_id ? `?workspace=${encodeURIComponent(token.workspace_id)}` : ''}`}
+                fontSize='sm'
+                color='blue.400'
+              >
+                Choose a certificate in CertOps
+              </Link>
+            </Box>
+          ) : certificateCount > 1 ? (
             <Text mb={4} fontSize='xs' color='dashboard.modal.muted'>
               {certificateCount} certificates reference this token. Showing{' '}
               {managedCertificateId
