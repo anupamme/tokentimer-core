@@ -581,6 +581,33 @@ opts into a mounted Kubernetes ServiceAccount token. Its distinct identity has
 the mode-specific least-privilege RBAC described above, with Secret `get` added
 only when fallback is explicitly enabled.
 
+### Verifying Core image signatures
+
+Core release images are signed with Cosign using GitHub Actions OIDC
+(keyless signing). Signatures are attached to the immutable image digest.
+
+To verify a released Core image, first resolve the exact digest you want
+to verify, then run:
+
+```bash
+IMAGE="ghcr.io/tokentimerch/tokentimer-core-api@sha256:<DIGEST>"
+
+cosign verify \
+  --certificate-identity-regexp="^https://github\.com/tokentimerch/tokentimer-core/\.github/workflows/release\.yml@refs/tags/v.+$" \
+  --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+  "${IMAGE}"
+```
+
+Replace `<DIGEST>` with the exact SHA-256 digest published for the release.
+
+The verification succeeds only when the image has a valid Cosign signature
+issued through GitHub Actions OIDC by the TokenTimer Core `release.yml`
+workflow on a version tag.
+
+Verification fails with a non-zero exit code if the image is unsigned, the
+signature is invalid, the OIDC issuer is unexpected, or the signing workflow
+identity does not match the expected release workflow.
+
 ## Upgrading
 
 ```bash
