@@ -340,8 +340,17 @@ describe('CertificateDetailsModal', () => {
       .getByRole('heading', { name: 'Notes' })
       .closest('section');
     expect(within(notesSection).getAllByText('Notes')).toHaveLength(1);
+    expect(notesSection).toHaveAttribute('data-compact-section', 'true');
     expect(
       notesSection.querySelector('[data-detail-columns="1"]')
+    ).toBeInTheDocument();
+
+    const jobHistorySection = screen
+      .getByRole('heading', { name: 'Job history' })
+      .closest('section');
+    expect(jobHistorySection).toHaveAttribute('data-compact-section', 'true');
+    expect(
+      jobHistorySection.querySelector('[data-detail-columns="1"]')
     ).toBeInTheDocument();
   });
 
